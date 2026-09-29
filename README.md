@@ -2,7 +2,7 @@
 
 这个目录提供一个独立的、声明式的 GOAL workload 生成器。输入可以是：
 
-- collective 级 DAG：覆盖 Atlas 当前实现的全部 collective/operator/algorithm 组合；先 lowering 成成对的 p2p send/recv，再写 GOAL binary，并输出完整 flow metadata。
+- collective 级 DAG：可在 collective 之间混合 compute/sink/barrier 节点，并覆盖 Atlas 当前实现的全部 collective/operator/algorithm 组合；collective 先 lowering 成成对的 p2p send/recv，再与本地 compute 一起写入 GOAL binary，并输出完整 flow metadata。
 - p2p flow 级 DAG：直接指定 flow、compute 与依赖关系，直接写 GOAL binary；不生成 collective metadata。
 
 生成器不依赖 Atlas 或第三方 Python 包。它直接实现 Atlas/LogGOPSim 使用的 GOAL binary 格式，也保留一份可读的 `workload.goal` 便于检查。
@@ -79,6 +79,58 @@ GOAL 的依赖是 rank-local 的。因此一条高层依赖边的两端必须至
 `compute`、`sink` 和 `barrier` 都是本地计算节点，使用 `ranks` 与 `duration_ns`。`ranks` 可以是 `"all"` 或 rank 数组。`duration_ns` 可为一个整数，也可为按 rank 给值的对象。
 
 ### Collective DAG
+
+Collective DAG 不只能包含通信算子，也支持 `compute`、`sink` 和 `barrier` 本地计算节点。这三种节点的字段相同：
+
+- `ranks`: 执行该节点的 GOAL rank，可为 `"all"` 或非空 rank 数组，例如 `[0, 2]`。
+- `duration_ns`: 本地计算时间，可为所有 rank 共用的非负整数，也可为按 rank 设置的对象，例如 `{"0": 1000, "1": 1500}`。
+- `cpu`: 可选 GOAL CPU ID；省略时使用 `defaults.cpu` 或 `0`。
+- `depends_on`: 前驱节点 ID 数组。依赖按共有 rank 投影：每个 compute 会等待同一 rank 上的前驱 collective lowering 完成。
+
+`compute`、`sink` 和 `barrier` 都会生成 GOAL `calc` 任务，不会 lowering 成网络 flow。`sink` 通常使用 `duration_ns: 0` 来汇合多个分支。`barrier` 是用于表达依赖的 rank-local anchor；它不会隐式增加跨 rank 同步，所有前驱都需要在 `depends_on` 中显式列出。
+
+一个 `collective -> compute -> sink` 示例：
+
+```json
+{
+  "schema_version": 1,
+  "kind": "collective",
+  "name": "allreduce_with_compute",
+  "world_size": 4,
+  "nodes": [
+    {
+      "id": "allreduce",
+      "op": "allreduce",
+      "algorithm": "ring",
+      "protocol": "simple",
+      "ranks": "all",
+      "bytes": 4194304
+    },
+    {
+      "id": "post_compute",
+      "op": "compute",
+      "ranks": "all",
+      "duration_ns": 2500,
+      "depends_on": ["allreduce"]
+    },
+    {
+      "id": "sink",
+      "op": "sink",
+      "ranks": "all",
+      "duration_ns": 0,
+      "depends_on": ["post_compute"]
+    }
+  ]
+}
+```
+
+多分支写法可直接参考 `templates/collective_dag.json`，其结构为：
+
+```text
+AllToAll       -> compute --+
+AllReduce Ring -> compute --+-> sink
+AllReduce Tree -> compute --+
+```
 
 支持矩阵与 Atlas `nccl_generator_v2/nccl_comm.py` 保持一致：
 
