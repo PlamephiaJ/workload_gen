@@ -55,13 +55,17 @@ def compare(atlas_root: Path) -> dict[str, dict[str, int]]:
     import goal  # type: ignore
     import nccl_primitives  # type: ignore
     from nccl_comm import (  # type: ignore
+        AllGather,
         AllReduce,
         AllToAll,
+        Broadcast,
         CollAlgo,
         CollChnlInfo,
         CollInfo,
         Communicator,
         NCCLProto,
+        Reduce,
+        ReduceScatter,
     )
 
     nccl_primitives.init_generation_flags(True, False, False)
@@ -144,6 +148,247 @@ def compare(atlas_root: Path) -> dict[str, dict[str, int]]:
     }
     tree_ref = [AllReduce(gpu_id, comm, tree_info, [tree_channel], 3) for gpu_id in gpu_ids]
     cases.append(("allreduce_tree", tree_spec, tree_ref))
+
+    allgather_info = CollInfo(0, 0, CollAlgo.RING, NCCLProto.SIMPLE, 1024, 1, 1, 1, 1024)
+    allgather_spec = {
+        **base,
+        "name": "compare_allgather",
+        "nodes": [
+            {
+                "id": "c",
+                "op": "allgather",
+                "algorithm": "ring",
+                "protocol": "simple",
+                "ranks": ranks,
+                "bytes_per_rank": 1024,
+                "collective_id": 4,
+            }
+        ],
+    }
+    allgather_ref = []
+    for rank, gpu_id in enumerate(gpu_ids):
+        channel = CollChnlInfo(1024, 1024, 1024, 1024, 0, rank * 1024, 0)
+        allgather_ref.append(AllGather(gpu_id, comm, allgather_info, [channel], 4))
+    cases.append(("allgather_ring", allgather_spec, allgather_ref))
+
+    rs_info = CollInfo(0, 0, CollAlgo.RING, NCCLProto.SIMPLE, 4096, 1, 1, 1, 1024)
+    rs_channel = CollChnlInfo(4096, 1024, 1024, 1024, 0, 0, 0)
+    rs_spec = {
+        **base,
+        "name": "compare_reduce_scatter",
+        "nodes": [
+            {
+                "id": "c",
+                "op": "reduce_scatter",
+                "algorithm": "ring",
+                "protocol": "simple",
+                "ranks": ranks,
+                "bytes": 4096,
+                "collective_id": 5,
+            }
+        ],
+    }
+    rs_ref = [ReduceScatter(gpu_id, comm, rs_info, [rs_channel], 5) for gpu_id in gpu_ids]
+    cases.append(("reduce_scatter_ring", rs_spec, rs_ref))
+
+    reduce_info = CollInfo(0, 0, CollAlgo.RING, NCCLProto.SIMPLE, 2048, 1, 1, 1, 2048)
+    reduce_channel = CollChnlInfo(2048, 2048, 2048, 2048, 0, 0, 0)
+    reduce_spec = {
+        **base,
+        "name": "compare_reduce",
+        "nodes": [
+            {
+                "id": "c",
+                "op": "reduce",
+                "algorithm": "ring",
+                "protocol": "simple",
+                "ranks": ranks,
+                "bytes": 2048,
+                "root": 0,
+                "collective_id": 6,
+            }
+        ],
+    }
+    reduce_ref = [Reduce(gpu_id, comm, reduce_info, [reduce_channel], 6) for gpu_id in gpu_ids]
+    cases.append(("reduce_ring", reduce_spec, reduce_ref))
+
+    broadcast_info = CollInfo(0, 0, CollAlgo.RING, NCCLProto.SIMPLE, 2048, 1, 1, 1, 2048)
+    broadcast_channel = CollChnlInfo(2048, 2048, 2048, 2048, 0, 0, 0)
+    broadcast_spec = {
+        **base,
+        "name": "compare_broadcast",
+        "nodes": [
+            {
+                "id": "c",
+                "op": "broadcast",
+                "algorithm": "ring",
+                "protocol": "simple",
+                "ranks": ranks,
+                "bytes": 2048,
+                "root": 0,
+                "collective_id": 7,
+            }
+        ],
+    }
+    broadcast_ref = [Broadcast(gpu_id, comm, broadcast_info, [broadcast_channel], 7) for gpu_id in gpu_ids]
+    cases.append(("broadcast_ring", broadcast_spec, broadcast_ref))
+
+    for protocol_name, atlas_protocol, collective_id in [
+        ("ll", NCCLProto.LL, 8),
+        ("ll128", NCCLProto.LL128, 9),
+    ]:
+        protocol_info = CollInfo(0, 0, CollAlgo.TREE, atlas_protocol, 2049, 1, 1, 1, 2049)
+        protocol_channel = CollChnlInfo(2049, 2049, 2049, 2049, 0, 0, 0)
+        protocol_spec = {
+            **base,
+            "name": f"compare_tree_{protocol_name}",
+            "nodes": [
+                {
+                    "id": "c",
+                    "op": "allreduce",
+                    "algorithm": "tree",
+                    "protocol": protocol_name,
+                    "ranks": ranks,
+                    "bytes": 2049,
+                    "chunk_bytes": 2049,
+                    "tree_parent": {str(rank): parent for rank, parent in parents.items()},
+                    "collective_id": collective_id,
+                }
+            ],
+        }
+        protocol_ref = [
+            AllReduce(gpu_id, comm, protocol_info, [protocol_channel], collective_id)
+            for gpu_id in gpu_ids
+        ]
+        cases.append((f"allreduce_tree_{protocol_name}", protocol_spec, protocol_ref))
+
+        ring_protocol_info = CollInfo(0, 0, CollAlgo.RING, atlas_protocol, 4100, 1, 1, 1, 1025)
+        ring_protocol_channel = CollChnlInfo(4100, 1025, 4100, 1025, 0, 0, 0)
+        ring_protocol_spec = {
+            **base,
+            "name": f"compare_ring_{protocol_name}",
+            "nodes": [
+                {
+                    "id": "c",
+                    "op": "allreduce",
+                    "algorithm": "ring",
+                    "protocol": protocol_name,
+                    "ranks": ranks,
+                    "bytes": 4100,
+                    "collective_id": collective_id + 10,
+                }
+            ],
+        }
+        ring_protocol_ref = [
+            AllReduce(gpu_id, comm, ring_protocol_info, [ring_protocol_channel], collective_id + 10)
+            for gpu_id in gpu_ids
+        ]
+        cases.append((f"allreduce_ring_{protocol_name}", ring_protocol_spec, ring_protocol_ref))
+
+        ag_protocol_info = CollInfo(0, 0, CollAlgo.RING, atlas_protocol, 1025, 1, 1, 1, 1025)
+        ag_protocol_spec = {
+            **base,
+            "name": f"compare_allgather_{protocol_name}",
+            "nodes": [
+                {
+                    "id": "c",
+                    "op": "allgather",
+                    "algorithm": "ring",
+                    "protocol": protocol_name,
+                    "ranks": ranks,
+                    "bytes_per_rank": 1025,
+                    "collective_id": collective_id + 20,
+                }
+            ],
+        }
+        ag_protocol_ref = []
+        for rank, gpu_id in enumerate(gpu_ids):
+            channel = CollChnlInfo(1025, 1025, 1025, 1025, 0, rank * 1025, 0)
+            ag_protocol_ref.append(
+                AllGather(gpu_id, comm, ag_protocol_info, [channel], collective_id + 20)
+            )
+        cases.append((f"allgather_ring_{protocol_name}", ag_protocol_spec, ag_protocol_ref))
+
+        rs_protocol_info = CollInfo(0, 0, CollAlgo.RING, atlas_protocol, 4100, 1, 1, 1, 1025)
+        rs_protocol_channel = CollChnlInfo(4100, 1025, 1025, 1025, 0, 0, 0)
+        rs_protocol_spec = {
+            **base,
+            "name": f"compare_reduce_scatter_{protocol_name}",
+            "nodes": [
+                {
+                    "id": "c",
+                    "op": "reduce_scatter",
+                    "algorithm": "ring",
+                    "protocol": protocol_name,
+                    "ranks": ranks,
+                    "bytes": 4100,
+                    "collective_id": collective_id + 30,
+                }
+            ],
+        }
+        rs_protocol_ref = [
+            ReduceScatter(gpu_id, comm, rs_protocol_info, [rs_protocol_channel], collective_id + 30)
+            for gpu_id in gpu_ids
+        ]
+        cases.append((f"reduce_scatter_ring_{protocol_name}", rs_protocol_spec, rs_protocol_ref))
+
+        reduce_protocol_info = CollInfo(0, 0, CollAlgo.RING, atlas_protocol, 2049, 1, 1, 1, 2049)
+        reduce_protocol_channel = CollChnlInfo(2049, 2049, 2049, 2049, 0, 0, 0)
+        reduce_protocol_spec = {
+            **base,
+            "name": f"compare_reduce_{protocol_name}",
+            "nodes": [
+                {
+                    "id": "c",
+                    "op": "reduce",
+                    "algorithm": "ring",
+                    "protocol": protocol_name,
+                    "ranks": ranks,
+                    "bytes": 2049,
+                    "root": 0,
+                    "collective_id": collective_id + 40,
+                }
+            ],
+        }
+        reduce_protocol_ref = [
+            Reduce(gpu_id, comm, reduce_protocol_info, [reduce_protocol_channel], collective_id + 40)
+            for gpu_id in gpu_ids
+        ]
+        cases.append((f"reduce_ring_{protocol_name}", reduce_protocol_spec, reduce_protocol_ref))
+
+        broadcast_protocol_info = CollInfo(
+            0, 0, CollAlgo.RING, atlas_protocol, 2049, 1, 1, 1, 2049
+        )
+        broadcast_protocol_channel = CollChnlInfo(2049, 2049, 2049, 2049, 0, 0, 0)
+        broadcast_protocol_spec = {
+            **base,
+            "name": f"compare_broadcast_{protocol_name}",
+            "nodes": [
+                {
+                    "id": "c",
+                    "op": "broadcast",
+                    "algorithm": "ring",
+                    "protocol": protocol_name,
+                    "ranks": ranks,
+                    "bytes": 2049,
+                    "root": 0,
+                    "collective_id": collective_id + 50,
+                }
+            ],
+        }
+        broadcast_protocol_ref = [
+            Broadcast(
+                gpu_id,
+                comm,
+                broadcast_protocol_info,
+                [broadcast_protocol_channel],
+                collective_id + 50,
+            )
+            for gpu_id in gpu_ids
+        ]
+        cases.append(
+            (f"broadcast_ring_{protocol_name}", broadcast_protocol_spec, broadcast_protocol_ref)
+        )
 
     report: dict[str, dict[str, int]] = {}
     for name, spec, reference_operations in cases:

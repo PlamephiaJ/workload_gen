@@ -53,10 +53,22 @@ class Compiler:
                 spans = self._compile_compute(node)
             elif self.kind == "flow" and op == "flow":
                 spans = self._compile_direct_flow(node)
-            elif self.kind == "collective" and op in {"alltoall", "allreduce"}:
+            elif self.kind == "collective" and op in {
+                "alltoall",
+                "allreduce",
+                "allgather",
+                "reduce_scatter",
+                "reducescatter",
+                "reduce",
+                "broadcast",
+            }:
                 spans = self._compile_collective(node)
             else:
-                supported = "compute/sink/barrier/flow" if self.kind == "flow" else "compute/sink/barrier/alltoall/allreduce"
+                supported = (
+                    "compute/sink/barrier/flow"
+                    if self.kind == "flow"
+                    else "compute/sink/barrier/alltoall/allreduce/allgather/reduce_scatter/reduce/broadcast"
+                )
                 raise ValueError(f"node {node_id}: unsupported op {op!r}; supported: {supported}")
 
             for dependency in node.get("depends_on", []):
@@ -231,7 +243,27 @@ class Compiler:
         )
         return collective_id, context, ordering_domain
 
+    def _protocol(self, node: dict[str, Any]) -> str:
+        protocol = str(self._value(node, "protocol", "simple")).lower()
+        if protocol not in {"simple", "ll", "ll128"}:
+            raise ValueError(f"node {node['id']}: protocol must be simple, ll, or ll128")
+        return protocol
+
+    def _wire_size(self, node: dict[str, Any], payload_bytes: int) -> int:
+        protocol = self._protocol(node)
+        if protocol in {"ll", "ll128"}:
+            return ((payload_bytes + 7) // 8) * 8
+        return payload_bytes
+
+    def _root(self, node: dict[str, Any], ranks: list[int]) -> int:
+        root = node.get("root", ranks[0])
+        if not isinstance(root, int) or isinstance(root, bool) or root not in ranks:
+            raise ValueError(f"node {node['id']}: root must be one of the collective ranks")
+        return root
+
     def _compile_collective(self, node: dict[str, Any]) -> dict[int, Span]:
+        if node["op"] == "reducescatter":
+            node = {**node, "op": "reduce_scatter"}
         ranks = self._ranks(node)
         if len(ranks) < 2:
             raise ValueError(f"node {node['id']}: collective requires at least two ranks")
@@ -239,6 +271,7 @@ class Compiler:
         collective_id, context, ordering_domain = self._collective_identity(node)
         op = node["op"]
         algorithm = node.get("algorithm", "direct" if op == "alltoall" else "ring")
+        protocol = self._protocol(node)
         descriptor = {
             "collective_id": collective_id,
             "node_id": node["id"],
@@ -247,18 +280,43 @@ class Compiler:
             "ranks": ranks,
             "context": context,
             "ordering_domain": ordering_domain,
+            "protocol": protocol,
         }
         if op == "alltoall":
+            if algorithm != "direct":
+                raise ValueError(f"node {node['id']}: Atlas supports only direct AllToAll")
+            if protocol != "simple":
+                raise ValueError(f"node {node['id']}: Atlas AllToAll always lowers with Simple protocol")
             spans = self._lower_alltoall(node, ranks, cpu, nic, collective_id, context, ordering_domain)
             descriptor["bytes_per_peer"] = node.get("bytes_per_peer")
-        elif algorithm == "ring":
+        elif op == "allreduce" and algorithm == "ring":
             spans = self._lower_ring_allreduce(node, ranks, cpu, nic, collective_id, context, ordering_domain)
             descriptor["bytes"] = node.get("bytes")
-        elif algorithm == "tree":
+        elif op == "allreduce" and algorithm == "tree":
             spans = self._lower_tree_allreduce(node, ranks, cpu, nic, collective_id, context, ordering_domain)
             descriptor["bytes"] = node.get("bytes")
+        elif algorithm != "ring":
+            raise ValueError(
+                f"node {node['id']}: Atlas implements {op} only for ring; tree lowering is not implemented"
+            )
+        elif op == "allgather":
+            spans = self._lower_ring_allgather(node, ranks, cpu, nic, collective_id, context, ordering_domain)
+            descriptor["bytes_per_rank"] = node.get("bytes_per_rank")
+        elif op == "reduce_scatter":
+            spans = self._lower_ring_reduce_scatter(
+                node, ranks, cpu, nic, collective_id, context, ordering_domain
+            )
+            descriptor["bytes"] = node.get("bytes")
+        elif op == "reduce":
+            spans = self._lower_ring_reduce(node, ranks, cpu, nic, collective_id, context, ordering_domain)
+            descriptor["bytes"] = node.get("bytes")
+            descriptor["root"] = self._root(node, ranks)
+        elif op == "broadcast":
+            spans = self._lower_ring_broadcast(node, ranks, cpu, nic, collective_id, context, ordering_domain)
+            descriptor["bytes"] = node.get("bytes")
+            descriptor["root"] = self._root(node, ranks)
         else:
-            raise ValueError(f"node {node['id']}: allreduce algorithm must be 'ring' or 'tree'")
+            raise AssertionError(f"unhandled collective op: {op}")
         self.collectives.append(descriptor)
         return spans
 
@@ -287,6 +345,35 @@ class Compiler:
         }
         result.update(extra)
         return result
+
+    def _add_collective_flow(
+        self,
+        node: dict[str, Any],
+        src: int,
+        dst: int,
+        payload_bytes: int,
+        *,
+        cpu: int,
+        nic: int,
+        context: int,
+        metadata: dict[str, Any],
+    ) -> FlowHandle:
+        wire_bytes = self._wire_size(node, payload_bytes)
+        enriched = {
+            **metadata,
+            "protocol": self._protocol(node),
+            "payload_bytes": payload_bytes,
+            "wire_bytes": wire_bytes,
+        }
+        return self._add_flow(
+            src,
+            dst,
+            wire_bytes,
+            cpu=cpu,
+            nic=nic,
+            context=context,
+            metadata=enriched,
+        )
 
     def _finalize_collective(
         self, spans: dict[int, Span], ranks: list[int], first_internal_id: dict[int, int]
@@ -326,7 +413,8 @@ class Compiler:
                 if src == dst:
                     continue
                 for chunk, chunk_size in enumerate(pieces):
-                    handles[(src, dst, chunk)] = self._add_flow(
+                    handles[(src, dst, chunk)] = self._add_collective_flow(
+                        node,
                         src,
                         dst,
                         chunk_size,
@@ -409,7 +497,8 @@ class Compiler:
                 for index, src in enumerate(order):
                     dst = order[(index + 1) % n]
                     chunk = (index - step - 1) % n
-                    reduce_flows[(step, src)] = self._add_flow(
+                    reduce_flows[(step, src)] = self._add_collective_flow(
+                        node,
                         src,
                         dst,
                         chunk_sizes[chunk],
@@ -432,7 +521,8 @@ class Compiler:
                 for index, src in enumerate(order):
                     dst = order[(index + 1) % n]
                     chunk = (index - step) % n
-                    gather_flows[(step, src)] = self._add_flow(
+                    gather_flows[(step, src)] = self._add_collective_flow(
+                        node,
                         src,
                         dst,
                         chunk_sizes[chunk],
@@ -485,6 +575,305 @@ class Compiler:
                         )
                         self.graphs[rank].require(calc, incoming.recv_task)
                         self.graphs[rank].require(gather_flows[(step + 1, rank)].send_task, calc)
+        self._finalize_collective(spans, ranks, first_internal)
+        return spans
+
+    def _lower_ring_allgather(
+        self,
+        node: dict[str, Any],
+        ranks: list[int],
+        cpu: int,
+        nic: int,
+        collective_id: int,
+        context: int,
+        ordering_domain: int,
+    ) -> dict[int, Span]:
+        bytes_per_rank = as_nonnegative_int(
+            node.get("bytes_per_rank"), f"node {node['id']}.bytes_per_rank"
+        )
+        channels = as_nonnegative_int(node.get("channels", 1), f"node {node['id']}.channels", positive=True)
+        orders = self._ring_orders(node, ranks, channels)
+        channel_sizes = _split_bytes(bytes_per_rank, channels)
+        maximum = as_nonnegative_int(
+            self._value(node, "chunk_bytes", max(1, bytes_per_rank)), "chunk_bytes", positive=True
+        )
+        in_place = node.get("in_place", True)
+        if not isinstance(in_place, bool):
+            raise ValueError(f"node {node['id']}.in_place must be boolean")
+        spans = self._new_anchors(node["id"], ranks, cpu)
+        first_internal = {rank: len(self.graphs[rank].tasks) for rank in ranks}
+
+        chunk_base = 0
+        for channel, (order, channel_size) in enumerate(zip(orders, channel_sizes)):
+            n = len(order)
+            pieces = _chunk_bytes(channel_size, maximum)
+            for piece, piece_size in enumerate(pieces):
+                flows: dict[tuple[int, int], FlowHandle] = {}
+                for step in range(n - 1):
+                    for index, src in enumerate(order):
+                        dst = order[(index + 1) % n]
+                        owner = (index - step) % n
+                        flows[(step, src)] = self._add_collective_flow(
+                            node,
+                            src,
+                            dst,
+                            piece_size,
+                            cpu=cpu,
+                            nic=nic,
+                            context=context,
+                            metadata=self._flow_meta(
+                                node,
+                                collective_id,
+                                "ring",
+                                "allgather",
+                                chunk_base + piece * n + owner,
+                                step,
+                                channel,
+                                ordering_domain,
+                                owner_rank=order[owner],
+                                piece=piece,
+                                in_place=in_place,
+                            ),
+                        )
+
+                for index, rank in enumerate(order):
+                    prev_rank = order[(index - 1) % n]
+                    first_send = flows[(0, rank)].send_task
+                    if in_place:
+                        self.graphs[rank].require(first_send, spans[rank].start)
+                    else:
+                        initial_copy = self.graphs[rank].add_calc(
+                            self._cost(node, "copy", self.graphs[rank].tasks[first_send].size),
+                            cpu=cpu,
+                            label=f"{node['id']}:ch{channel}:piece{piece}:initial-copy",
+                        )
+                        self.graphs[rank].require(initial_copy, spans[rank].start)
+                        self.graphs[rank].require(first_send, initial_copy)
+                    for step in range(n - 1):
+                        incoming = flows[(step, prev_rank)]
+                        self.graphs[rank].require(incoming.recv_task, spans[rank].start)
+                        if step < n - 2:
+                            size = self.graphs[rank].tasks[incoming.recv_task].size
+                            copy = self.graphs[rank].add_calc(
+                                self._cost(node, "copy", size),
+                                cpu=cpu,
+                                label=f"{node['id']}:ch{channel}:piece{piece}:copy:{step}",
+                            )
+                            self.graphs[rank].require(copy, incoming.recv_task)
+                            self.graphs[rank].require(flows[(step + 1, rank)].send_task, copy)
+            chunk_base += n * len(pieces)
+        self._finalize_collective(spans, ranks, first_internal)
+        return spans
+
+    def _lower_ring_reduce_scatter(
+        self,
+        node: dict[str, Any],
+        ranks: list[int],
+        cpu: int,
+        nic: int,
+        collective_id: int,
+        context: int,
+        ordering_domain: int,
+    ) -> dict[int, Span]:
+        total = as_nonnegative_int(node.get("bytes"), f"node {node['id']}.bytes")
+        channels = as_nonnegative_int(node.get("channels", 1), f"node {node['id']}.channels", positive=True)
+        orders = self._ring_orders(node, ranks, channels)
+        channel_sizes = _split_bytes(total, channels)
+        spans = self._new_anchors(node["id"], ranks, cpu)
+        first_internal = {rank: len(self.graphs[rank].tasks) for rank in ranks}
+
+        for channel, (order, channel_size) in enumerate(zip(orders, channel_sizes)):
+            n = len(order)
+            chunk_sizes = _split_bytes(channel_size, n)
+            flows: dict[tuple[int, int], FlowHandle] = {}
+            for step in range(n - 1):
+                for index, src in enumerate(order):
+                    dst = order[(index + 1) % n]
+                    chunk = (index - step - 1) % n
+                    flows[(step, src)] = self._add_collective_flow(
+                        node,
+                        src,
+                        dst,
+                        chunk_sizes[chunk],
+                        cpu=cpu,
+                        nic=nic,
+                        context=context,
+                        metadata=self._flow_meta(
+                            node,
+                            collective_id,
+                            "ring",
+                            "reduce_scatter",
+                            chunk,
+                            step,
+                            channel,
+                            ordering_domain,
+                            owner_rank=order[chunk],
+                            chunk_bytes=chunk_sizes[chunk],
+                        ),
+                    )
+            for index, rank in enumerate(order):
+                prev_rank = order[(index - 1) % n]
+                self.graphs[rank].require(flows[(0, rank)].send_task, spans[rank].start)
+                for step in range(n - 1):
+                    incoming = flows[(step, prev_rank)]
+                    self.graphs[rank].require(incoming.recv_task, spans[rank].start)
+                    size = self.graphs[rank].tasks[incoming.recv_task].size
+                    duration = self._cost(node, "reduction", size)
+                    if step == n - 2:
+                        duration += self._cost(node, "copy", size)
+                    reduce_calc = self.graphs[rank].add_calc(
+                        duration,
+                        cpu=cpu,
+                        label=f"{node['id']}:ch{channel}:reduce:{step}",
+                    )
+                    self.graphs[rank].require(reduce_calc, incoming.recv_task)
+                    if step < n - 2:
+                        self.graphs[rank].require(flows[(step + 1, rank)].send_task, reduce_calc)
+        self._finalize_collective(spans, ranks, first_internal)
+        return spans
+
+    def _lower_ring_reduce(
+        self,
+        node: dict[str, Any],
+        ranks: list[int],
+        cpu: int,
+        nic: int,
+        collective_id: int,
+        context: int,
+        ordering_domain: int,
+    ) -> dict[int, Span]:
+        total = as_nonnegative_int(node.get("bytes"), f"node {node['id']}.bytes")
+        root = self._root(node, ranks)
+        channels = as_nonnegative_int(node.get("channels", 1), f"node {node['id']}.channels", positive=True)
+        orders = self._ring_orders(node, ranks, channels)
+        if any(root not in order for order in orders):
+            raise ValueError(f"node {node['id']}: root is missing from a ring order")
+        channel_sizes = _split_bytes(total, channels)
+        maximum = as_nonnegative_int(
+            self._value(node, "chunk_bytes", max(1, total)), "chunk_bytes", positive=True
+        )
+        spans = self._new_anchors(node["id"], ranks, cpu)
+        first_internal = {rank: len(self.graphs[rank].tasks) for rank in ranks}
+
+        chunk = 0
+        for channel, (order, channel_size) in enumerate(zip(orders, channel_sizes)):
+            n = len(order)
+            root_index = order.index(root)
+            for piece, piece_size in enumerate(_chunk_bytes(channel_size, maximum)):
+                edges: list[FlowHandle] = []
+                for step in range(n - 1):
+                    src = order[(root_index + 1 + step) % n]
+                    dst = order[(root_index + 2 + step) % n]
+                    edges.append(
+                        self._add_collective_flow(
+                            node,
+                            src,
+                            dst,
+                            piece_size,
+                            cpu=cpu,
+                            nic=nic,
+                            context=context,
+                            metadata=self._flow_meta(
+                                node,
+                                collective_id,
+                                "ring",
+                                "reduce",
+                                chunk,
+                                step,
+                                channel,
+                                ordering_domain,
+                                root=root,
+                                piece=piece,
+                            ),
+                        )
+                    )
+                self.graphs[edges[0].src].require(edges[0].send_task, spans[edges[0].src].start)
+                for step, handle in enumerate(edges):
+                    rank = handle.dst
+                    self.graphs[rank].require(handle.recv_task, spans[rank].start)
+                    size = self.graphs[rank].tasks[handle.recv_task].size
+                    duration = self._cost(node, "reduction", size)
+                    if rank == root:
+                        duration += self._cost(node, "copy", size)
+                    reduce_calc = self.graphs[rank].add_calc(
+                        duration,
+                        cpu=cpu,
+                        label=f"{node['id']}:ch{channel}:chunk{chunk}:reduce:{step}",
+                    )
+                    self.graphs[rank].require(reduce_calc, handle.recv_task)
+                    if step + 1 < len(edges):
+                        self.graphs[rank].require(edges[step + 1].send_task, reduce_calc)
+                chunk += 1
+        self._finalize_collective(spans, ranks, first_internal)
+        return spans
+
+    def _lower_ring_broadcast(
+        self,
+        node: dict[str, Any],
+        ranks: list[int],
+        cpu: int,
+        nic: int,
+        collective_id: int,
+        context: int,
+        ordering_domain: int,
+    ) -> dict[int, Span]:
+        total = as_nonnegative_int(node.get("bytes"), f"node {node['id']}.bytes")
+        root = self._root(node, ranks)
+        channels = as_nonnegative_int(node.get("channels", 1), f"node {node['id']}.channels", positive=True)
+        orders = self._ring_orders(node, ranks, channels)
+        channel_sizes = _split_bytes(total, channels)
+        maximum = as_nonnegative_int(
+            self._value(node, "chunk_bytes", max(1, total)), "chunk_bytes", positive=True
+        )
+        spans = self._new_anchors(node["id"], ranks, cpu)
+        first_internal = {rank: len(self.graphs[rank].tasks) for rank in ranks}
+
+        chunk = 0
+        for channel, (order, channel_size) in enumerate(zip(orders, channel_sizes)):
+            n = len(order)
+            root_index = order.index(root)
+            for piece, piece_size in enumerate(_chunk_bytes(channel_size, maximum)):
+                edges: list[FlowHandle] = []
+                for step in range(n - 1):
+                    src = order[(root_index + step) % n]
+                    dst = order[(root_index + step + 1) % n]
+                    edges.append(
+                        self._add_collective_flow(
+                            node,
+                            src,
+                            dst,
+                            piece_size,
+                            cpu=cpu,
+                            nic=nic,
+                            context=context,
+                            metadata=self._flow_meta(
+                                node,
+                                collective_id,
+                                "ring",
+                                "broadcast",
+                                chunk,
+                                step,
+                                channel,
+                                ordering_domain,
+                                root=root,
+                                piece=piece,
+                            ),
+                        )
+                    )
+                self.graphs[root].require(edges[0].send_task, spans[root].start)
+                for step, handle in enumerate(edges):
+                    rank = handle.dst
+                    self.graphs[rank].require(handle.recv_task, spans[rank].start)
+                    if step + 1 < len(edges):
+                        size = self.graphs[rank].tasks[handle.recv_task].size
+                        copy = self.graphs[rank].add_calc(
+                            self._cost(node, "copy", size),
+                            cpu=cpu,
+                            label=f"{node['id']}:ch{channel}:chunk{chunk}:copy:{step}",
+                        )
+                        self.graphs[rank].require(copy, handle.recv_task)
+                        self.graphs[rank].require(edges[step + 1].send_task, copy)
+                chunk += 1
         self._finalize_collective(spans, ranks, first_internal)
         return spans
 
@@ -542,7 +931,8 @@ class Compiler:
             for rank, parent in parents.items():
                 if parent is None:
                     continue
-                upward[rank] = self._add_flow(
+                upward[rank] = self._add_collective_flow(
+                    node,
                     rank,
                     parent,
                     chunk_size,
@@ -563,7 +953,8 @@ class Compiler:
                         chunk_bytes=chunk_size,
                     ),
                 )
-                downward[rank] = self._add_flow(
+                downward[rank] = self._add_collective_flow(
+                    node,
                     parent,
                     rank,
                     chunk_size,

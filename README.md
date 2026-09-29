@@ -2,7 +2,7 @@
 
 这个目录提供一个独立的、声明式的 GOAL workload 生成器。输入可以是：
 
-- collective 级 DAG：当前支持 direct All-to-All、ring AllReduce、tree AllReduce；先 lowering 成成对的 p2p send/recv，再写 GOAL binary，并输出完整 flow metadata。
+- collective 级 DAG：覆盖 Atlas 当前实现的全部 collective/operator/algorithm 组合；先 lowering 成成对的 p2p send/recv，再写 GOAL binary，并输出完整 flow metadata。
 - p2p flow 级 DAG：直接指定 flow、compute 与依赖关系，直接写 GOAL binary；不生成 collective metadata。
 
 生成器不依赖 Atlas 或第三方 Python 包。它直接实现 Atlas/LogGOPSim 使用的 GOAL binary 格式，也保留一份可读的 `workload.goal` 便于检查。
@@ -13,6 +13,7 @@
 
 ```bash
 python3 generate.py templates/collective_dag.json
+python3 generate.py templates/collective_all_supported.json
 python3 generate.py templates/flow_dag.json
 ```
 
@@ -55,7 +56,7 @@ python3 generate.py templates/flow_dag.json --no-goal-text
 
 ## 输入模型
 
-两个模板都使用 JSON，以保证工具零依赖。共同字段：
+模板都使用 JSON，以保证工具零依赖。共同字段：
 
 - `schema_version`: 当前固定为 `1`。
 - `kind`: `collective` 或 `flow`。
@@ -78,6 +79,20 @@ GOAL 的依赖是 rank-local 的。因此一条高层依赖边的两端必须至
 `compute`、`sink` 和 `barrier` 都是本地计算节点，使用 `ranks` 与 `duration_ns`。`ranks` 可以是 `"all"` 或 rank 数组。`duration_ns` 可为一个整数，也可为按 rank 给值的对象。
 
 ### Collective DAG
+
+支持矩阵与 Atlas `nccl_generator_v2/nccl_comm.py` 保持一致：
+
+| Operator | Algorithm | Protocol |
+|---|---|---|
+| AllToAll | direct | Simple（Atlas 在该类中固定调用 Simple） |
+| AllReduce | ring | Simple / LL / LL128 |
+| AllReduce | tree | Simple / LL / LL128 |
+| AllGather | ring | Simple / LL / LL128 |
+| ReduceScatter | ring | Simple / LL / LL128 |
+| Reduce | ring | Simple / LL / LL128 |
+| Broadcast | ring | Simple / LL / LL128 |
+
+Atlas 没有实现 tree AllGather、tree ReduceScatter、tree Reduce 或 tree Broadcast；输入这些组合会得到明确错误，而不是静默换算法。`templates/collective_all_supported.json` 包含上表所有 operator/algorithm，可作为完整模板。
 
 All-to-All 使用：
 
@@ -116,6 +131,24 @@ Tree AllReduce 默认按 `ranks` 顺序构造平衡二叉树，也可显式指�
 }
 ```
 
+其余 ring 算子：
+
+```json
+{"op": "allgather", "algorithm": "ring", "bytes_per_rank": 1025, "in_place": true}
+{"op": "reduce_scatter", "algorithm": "ring", "bytes": 4100}
+{"op": "reduce", "algorithm": "ring", "bytes": 2049, "root": 0}
+{"op": "broadcast", "algorithm": "ring", "bytes": 2049, "root": 0}
+```
+
+Collective 的通用可选字段：
+
+- `protocol`: `simple`、`ll` 或 `ll128`；默认 `simple`。与 Atlas 一致，LL/LL128 的每个 primitive wire size 向上对齐到 8 bytes。
+- `channels`: channel 数；默认 1。
+- `ring_orders`: 每个 channel 一份 rank permutation；不指定时使用 `ranks` 顺序。
+- `chunk_bytes`: AllToAll、tree AllReduce、AllGather、Reduce、Broadcast 的最大 payload chunk。
+- `root`: Reduce/Broadcast 的 GOAL rank；默认 `ranks` 中第一个。
+- `in_place`: AllGather 是否 in-place；out-of-place 时在初始 send 前插入 Atlas `CopySend` 对应的 copy calc。
+
 Collective 可设置 `collective_id`、`context` 和 `ordering_domain`。自动 tag 遵循 Atlas 的编码习惯：
 
 ```text
@@ -123,6 +156,8 @@ tag = per_(src,dst,context)_message_sequence * 100000 + context
 ```
 
 `workload.meta.json` 的每个 flow 保存 `collective_id`、collective type、algorithm、phase、chunk、step、channel、ordering domain、src/dst、bytes、tag/message sequence，以及 send/recv 在各 rank 中的 task ID。
+
+协议 lowering 后还会记录 `protocol`、原始 `payload_bytes` 和实际 `wire_bytes`。
 
 `reduction_ns_per_byte`、`reduction_overhead_ns`、`copy_ns_per_byte`、`copy_overhead_ns` 可用于给 lowering 中的本地 reduction/copy 建模；默认数据率和 overhead 都是 0。模板展示了固定 overhead。
 
@@ -138,7 +173,10 @@ python3 -m unittest discover -s tests -v
 
 - binary round-trip、依赖计数、DAG 无环性与 send/recv 完整匹配；
 - 原生 Python writer 与 Atlas `txt2bin` 的逐字节比较；
-- direct All-to-All、ring AllReduce、tree AllReduce 的 p2p transfer multiset 与 `atlahs/goal_gen/ai/nccl_generator_v2` 参考实现比较。
+- 全部 7 个 operator/algorithm 组合的 p2p transfer multiset 与 `atlahs/goal_gen/ai/nccl_generator_v2` 参考实现比较；
+- 除固定 Simple 的 AllToAll 外，对每个组合分别验证 Simple、LL、LL128，共 19 个 Atlas 对照项。
+
+Atlas 对照脚本会导入 Atlas 自己的 `nccl_primitives.py`，因此该可选测试需要 numpy/scipy；生成器本身仍然零第三方依赖。
 
 也可单独运行 lowering 对照：
 

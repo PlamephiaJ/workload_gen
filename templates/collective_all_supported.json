@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "kind": "collective",
+  "name": "collective_all_atlas_supported",
+  "world_size": 4,
+  "flow_id_start": 2000,
+  "defaults": {
+    "cpu": 0,
+    "nic": 0,
+    "reduction_overhead_ns": 20,
+    "copy_overhead_ns": 10
+  },
+  "nodes": [
+    {"id": "start", "op": "compute", "ranks": "all", "duration_ns": 0},
+    {
+      "id": "alltoall_direct",
+      "op": "alltoall",
+      "algorithm": "direct",
+      "protocol": "simple",
+      "ranks": "all",
+      "bytes_per_peer": 1024,
+      "chunk_bytes": 1024,
+      "collective_id": 100,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "allreduce_ring",
+      "op": "allreduce",
+      "algorithm": "ring",
+      "protocol": "simple",
+      "ranks": "all",
+      "bytes": 4100,
+      "collective_id": 101,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "allreduce_tree",
+      "op": "allreduce",
+      "algorithm": "tree",
+      "protocol": "ll",
+      "ranks": "all",
+      "bytes": 2049,
+      "chunk_bytes": 2049,
+      "tree_parent": {"0": null, "1": 0, "2": 0, "3": 1},
+      "collective_id": 102,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "allgather_ring",
+      "op": "allgather",
+      "algorithm": "ring",
+      "protocol": "ll128",
+      "ranks": "all",
+      "bytes_per_rank": 1025,
+      "in_place": true,
+      "collective_id": 103,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "reduce_scatter_ring",
+      "op": "reduce_scatter",
+      "algorithm": "ring",
+      "protocol": "simple",
+      "ranks": "all",
+      "bytes": 4100,
+      "collective_id": 104,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "reduce_ring",
+      "op": "reduce",
+      "algorithm": "ring",
+      "protocol": "ll",
+      "ranks": "all",
+      "bytes": 2049,
+      "root": 0,
+      "collective_id": 105,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "broadcast_ring",
+      "op": "broadcast",
+      "algorithm": "ring",
+      "protocol": "ll128",
+      "ranks": "all",
+      "bytes": 2049,
+      "root": 0,
+      "collective_id": 106,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "sink",
+      "op": "sink",
+      "ranks": "all",
+      "duration_ns": 0,
+      "depends_on": [
+        "alltoall_direct",
+        "allreduce_ring",
+        "allreduce_tree",
+        "allgather_ring",
+        "reduce_scatter_ring",
+        "reduce_ring",
+        "broadcast_ring"
+      ]
+    }
+  ]
+}

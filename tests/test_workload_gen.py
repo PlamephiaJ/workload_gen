@@ -51,6 +51,56 @@ class WorkloadGenerationTests(unittest.TestCase):
             self.assertIn("send_task", flow)
             self.assertIn("recv_task", flow)
 
+    def test_all_atlas_supported_collectives_template(self) -> None:
+        temp, _, workload, _, _, stats = self._generate("collective_all_supported.json")
+        self.addCleanup(temp.cleanup)
+        matrix = {(item["type"], item["algorithm"]) for item in workload.collectives}
+        self.assertEqual(
+            matrix,
+            {
+                ("alltoall", "direct"),
+                ("allreduce", "ring"),
+                ("allreduce", "tree"),
+                ("allgather", "ring"),
+                ("reduce_scatter", "ring"),
+                ("reduce", "ring"),
+                ("broadcast", "ring"),
+            },
+        )
+        self.assertEqual(stats["flows"], 72)
+        self.assertEqual(len(workload.flows), 72)
+        for flow in workload.flows.values():
+            self.assertIn(flow["protocol"], {"simple", "ll", "ll128"})
+            self.assertEqual(flow["bytes"], flow["wire_bytes"])
+            if flow["protocol"] in {"ll", "ll128"}:
+                self.assertEqual(flow["wire_bytes"] % 8, 0)
+
+    def test_atlas_unsupported_combinations_are_rejected(self) -> None:
+        base = {
+            "schema_version": 1,
+            "kind": "collective",
+            "name": "unsupported",
+            "world_size": 2,
+        }
+        with self.assertRaisesRegex(ValueError, "only for ring"):
+            compile_spec(
+                {
+                    **base,
+                    "nodes": [
+                        {"id": "c", "op": "allgather", "algorithm": "tree", "bytes_per_rank": 8}
+                    ],
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "always lowers with Simple"):
+            compile_spec(
+                {
+                    **base,
+                    "nodes": [
+                        {"id": "c", "op": "alltoall", "algorithm": "direct", "protocol": "ll", "bytes_per_peer": 8}
+                    ],
+                }
+            )
+
     def test_rank_disjoint_dependency_is_rejected(self) -> None:
         spec = {
             "schema_version": 1,
@@ -91,6 +141,30 @@ class WorkloadGenerationTests(unittest.TestCase):
         self.assertEqual(report["alltoall_direct"]["matched_transfers"], 48)
         self.assertEqual(report["allreduce_ring"]["matched_transfers"], 24)
         self.assertEqual(report["allreduce_tree"]["matched_transfers"], 6)
+        self.assertEqual(
+            set(report),
+            {
+                "alltoall_direct",
+                "allreduce_ring",
+                "allreduce_tree",
+                "allgather_ring",
+                "reduce_scatter_ring",
+                "reduce_ring",
+                "broadcast_ring",
+                "allreduce_tree_ll",
+                "allreduce_ring_ll",
+                "allgather_ring_ll",
+                "reduce_scatter_ring_ll",
+                "reduce_ring_ll",
+                "broadcast_ring_ll",
+                "allreduce_tree_ll128",
+                "allreduce_ring_ll128",
+                "allgather_ring_ll128",
+                "reduce_scatter_ring_ll128",
+                "reduce_ring_ll128",
+                "broadcast_ring_ll128",
+            },
+        )
 
 
 if __name__ == "__main__":
