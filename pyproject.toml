@@ -1,0 +1,13 @@
+[project]
+name = "htsim-workload-gen"
+version = "0.1.0"
+description = "Declarative collective and point-to-point DAG generator for HTSim GOAL binaries"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+workload-gen = "workload_gen.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

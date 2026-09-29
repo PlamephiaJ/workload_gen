@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "kind": "collective",
+  "name": "collective_three_branches",
+  "world_size": 4,
+  "flow_id_start": 1000,
+  "defaults": {
+    "cpu": 0,
+    "nic": 0,
+    "chunk_bytes": 262144,
+    "reduction_ns_per_byte": 0.0,
+    "reduction_overhead_ns": 20,
+    "copy_ns_per_byte": 0.0,
+    "copy_overhead_ns": 10
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "op": "compute",
+      "ranks": "all",
+      "duration_ns": 0
+    },
+    {
+      "id": "alltoall",
+      "op": "alltoall",
+      "algorithm": "direct",
+      "ranks": "all",
+      "bytes_per_peer": 1048576,
+      "chunk_bytes": 262144,
+      "collective_id": 17,
+      "context": 17,
+      "ordering_domain": 0,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "alltoall_compute",
+      "op": "compute",
+      "ranks": "all",
+      "duration_ns": 2500,
+      "depends_on": ["alltoall"]
+    },
+    {
+      "id": "ring_allreduce",
+      "op": "allreduce",
+      "algorithm": "ring",
+      "ranks": "all",
+      "bytes": 4194304,
+      "channels": 1,
+      "ring_orders": [[0, 1, 2, 3]],
+      "collective_id": 18,
+      "context": 18,
+      "ordering_domain": 1,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "ring_compute",
+      "op": "compute",
+      "ranks": "all",
+      "duration_ns": 3000,
+      "depends_on": ["ring_allreduce"]
+    },
+    {
+      "id": "tree_allreduce",
+      "op": "allreduce",
+      "algorithm": "tree",
+      "ranks": "all",
+      "bytes": 2097152,
+      "chunk_bytes": 524288,
+      "tree_parent": {
+        "0": null,
+        "1": 0,
+        "2": 0,
+        "3": 1
+      },
+      "collective_id": 19,
+      "context": 19,
+      "ordering_domain": 2,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "tree_compute",
+      "op": "compute",
+      "ranks": "all",
+      "duration_ns": 3500,
+      "depends_on": ["tree_allreduce"]
+    },
+    {
+      "id": "sink",
+      "op": "sink",
+      "ranks": "all",
+      "duration_ns": 0,
+      "depends_on": ["alltoall_compute", "ring_compute", "tree_compute"]
+    }
+  ]
+}
+

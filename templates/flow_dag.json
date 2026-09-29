@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "kind": "flow",
+  "name": "flow_three_branches",
+  "world_size": 4,
+  "defaults": {
+    "cpu": 0,
+    "nic": 0,
+    "chunk_bytes": 1048576
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "op": "compute",
+      "ranks": [0, 1, 2, 3],
+      "duration_ns": 0
+    },
+    {
+      "id": "flow1",
+      "op": "flow",
+      "src": 0,
+      "dst": 3,
+      "bytes": 1048576,
+      "tag": 101,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "flow1_compute",
+      "op": "compute",
+      "ranks": [3],
+      "duration_ns": 1200,
+      "depends_on": ["flow1"]
+    },
+    {
+      "id": "flow2",
+      "op": "flow",
+      "src": 1,
+      "dst": 3,
+      "bytes": 2097152,
+      "tag": 201,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "flow2_compute",
+      "op": "compute",
+      "ranks": [3],
+      "duration_ns": 1800,
+      "depends_on": ["flow2"]
+    },
+    {
+      "id": "flow3",
+      "op": "flow",
+      "src": 2,
+      "dst": 3,
+      "bytes": 3145728,
+      "tag": 301,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "flow3_compute",
+      "op": "compute",
+      "ranks": [3],
+      "duration_ns": 2400,
+      "depends_on": ["flow3"]
+    },
+    {
+      "id": "sink",
+      "op": "sink",
+      "ranks": [3],
+      "duration_ns": 0,
+      "depends_on": ["flow1_compute", "flow2_compute", "flow3_compute"]
+    }
+  ]
+}
+
