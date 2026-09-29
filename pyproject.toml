@@ -1,6 +1,6 @@
 [project]
 name = "htsim-workload-gen"
-version = "0.2.0"
+version = "0.3.0"
 description = "Declarative collective and point-to-point DAG generator for HTSim GOAL binaries"
 requires-python = ">=3.10"
 dependencies = []

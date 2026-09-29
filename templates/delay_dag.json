@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "kind": "collective",
+  "name": "collective_with_delay",
+  "world_size": 4,
+  "defaults": {
+    "cpu": 0,
+    "nic": 0,
+    "chunk_bytes": 262144
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "op": "compute",
+      "ranks": "all",
+      "duration_ns": 0
+    },
+    {
+      "id": "allreduce",
+      "op": "allreduce",
+      "algorithm": "ring",
+      "protocol": "simple",
+      "ranks": "all",
+      "bytes": 1048576,
+      "collective_id": 30,
+      "context": 30,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "between_stages",
+      "op": "delay",
+      "ranks": "all",
+      "duration_ns": {
+        "0": 5000,
+        "1": 6000,
+        "2": 7000,
+        "3": 8000
+      },
+      "depends_on": ["allreduce"]
+    },
+    {
+      "id": "allgather",
+      "op": "allgather",
+      "algorithm": "ring",
+      "protocol": "simple",
+      "ranks": "all",
+      "bytes_per_rank": 262144,
+      "in_place": true,
+      "collective_id": 31,
+      "context": 31,
+      "depends_on": ["between_stages"]
+    },
+    {
+      "id": "sink",
+      "op": "sink",
+      "ranks": "all",
+      "duration_ns": 0,
+      "depends_on": ["allgather"]
+    }
+  ]
+}

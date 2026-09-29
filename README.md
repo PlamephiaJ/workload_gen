@@ -2,8 +2,8 @@
 
 这个目录提供一个独立的、声明式的 GOAL workload 生成器。输入可以是：
 
-- collective 级 DAG：可在 collective 之间混合 compute/sink/barrier 节点，并覆盖 Atlas 当前实现的全部 collective/operator/algorithm 组合；collective 先 lowering 成成对的 p2p send/recv，再与本地 compute 一起写入 GOAL binary，并输出完整 flow metadata。
-- p2p flow 级 DAG：直接指定 flow、compute 与依赖关系，直接写 GOAL binary；不生成 collective metadata。
+- collective 级 DAG：可在 collective 之间混合 compute/delay/sink/barrier 节点，并覆盖 Atlas 当前实现的全部 collective/operator/algorithm 组合；collective 先 lowering 成成对的 p2p send/recv，再与本地节点一起写入 GOAL binary，并输出完整 flow metadata。
+- p2p flow 级 DAG：直接指定 flow、compute、delay 与依赖关系，直接写 GOAL binary；不生成 collective metadata。
 
 生成器不依赖 Atlas 或第三方 Python 包。它直接实现 Atlas/LogGOPSim 使用的 GOAL binary 格式，也保留一份可读的 `workload.goal` 便于检查。
 
@@ -15,6 +15,7 @@
 python3 generate.py templates/collective_dag.json
 python3 generate.py templates/collective_all_supported.json
 python3 generate.py templates/flow_dag.json
+python3 generate.py templates/delay_dag.json
 ```
 
 也可以使用 uv；项目没有外部运行时依赖：
@@ -31,9 +32,13 @@ outputs/
 │   ├── workload.bin
 │   ├── workload.goal
 │   └── workload.meta.json
-└── flow_three_branches/
+├── flow_three_branches/
+│   ├── workload.bin
+│   └── workload.goal
+└── collective_with_delay/
     ├── workload.bin
-    └── workload.goal
+    ├── workload.goal
+    └── workload.meta.json
 ```
 
 指定输出根目录：
@@ -76,18 +81,36 @@ GOAL 的依赖是 rank-local 的。因此一条高层依赖边的两端必须至
 - `chunk_bytes`: 可选；flow 大于该值时拆为多个有序消息。
 - `cpu`, `nic`: 可选，范围 `0..255`。
 
-`compute`、`sink` 和 `barrier` 都是本地计算节点，使用 `ranks` 与 `duration_ns`。`ranks` 可以是 `"all"` 或 rank 数组。`duration_ns` 可为一个整数，也可为按 rank 给值的对象。
+`compute`、`delay`、`sink` 和 `barrier` 都是本地计算节点，使用 `ranks` 与 `duration_ns`。`ranks` 可以是 `"all"` 或 rank 数组。`duration_ns` 可为一个整数，也可为按 rank 给值的对象。
 
 ### Collective DAG
 
-Collective DAG 不只能包含通信算子，也支持 `compute`、`sink` 和 `barrier` 本地计算节点。这三种节点的字段相同：
+Collective DAG 不只能包含通信算子，也支持 `compute`、`delay`、`sink` 和 `barrier` 本地节点。这四种节点的字段相同：
 
 - `ranks`: 执行该节点的 GOAL rank，可为 `"all"` 或非空 rank 数组，例如 `[0, 2]`。
 - `duration_ns`: 本地计算时间，可为所有 rank 共用的非负整数，也可为按 rank 设置的对象，例如 `{"0": 1000, "1": 1500}`。
 - `cpu`: 可选 GOAL CPU ID；省略时使用 `defaults.cpu` 或 `0`。
-- `depends_on`: 前驱节点 ID 数组。依赖按共有 rank 投影：每个 compute 会等待同一 rank 上的前驱 collective lowering 完成。
+- `depends_on`: 前驱节点 ID 数组。依赖按共有 rank 投影：每个本地节点会等待同一 rank 上的前驱 collective lowering 完成。
 
-`compute`、`sink` 和 `barrier` 都会生成 GOAL `calc` 任务，不会 lowering 成网络 flow。`sink` 通常使用 `duration_ns: 0` 来汇合多个分支。`barrier` 是用于表达依赖的 rank-local anchor；它不会隐式增加跨 rank 同步，所有前驱都需要在 `depends_on` 中显式列出。
+`compute`、`delay`、`sink` 和 `barrier` 都会生成 GOAL `calc` 任务，不会 lowering 成网络 flow。`sink` 通常使用 `duration_ns: 0` 来汇合多个分支。`barrier` 是用于表达依赖的 rank-local anchor；它不会隐式增加跨 rank 同步，所有前驱都需要在 `depends_on` 中显式列出。
+
+#### Delay 节点
+
+`delay` 专门表达计算图中的等待、软件开销或其他不产生通信的中间延迟。它与 `compute` 使用相同的 GOAL `calc` 表示，因此 HTSim 会推进对应 rank 的时间，但不会创建 p2p flow。Collective workload 的 `workload.meta.json` 会在 `source_graph.nodes` 中保留原始 `op: "delay"`，便于区分它与普通计算。
+
+```json
+{
+  "id": "between_stages",
+  "op": "delay",
+  "ranks": "all",
+  "duration_ns": 5000,
+  "depends_on": ["allreduce"]
+}
+```
+
+`duration_ns` 也可以按 rank 指定，例如 `{"0": 5000, "1": 6500}`。delay 只等待与自己共享 rank 的前驱；如果一条边两端没有任何共同 rank，编译器会报错。
+
+完整的 `collective -> delay -> collective -> sink` 可运行示例见 `templates/delay_dag.json`。
 
 一个 `collective -> compute -> sink` 示例：
 
@@ -224,6 +247,7 @@ python3 -m unittest discover -s tests -v
 测试包括：
 
 - binary round-trip、依赖计数、DAG 无环性与 send/recv 完整匹配；
+- `delay` 在 flow 与 collective DAG 中的 rank-local lowering、时长和依赖；
 - 原生 Python writer 与 Atlas `txt2bin` 的逐字节比较；
 - 全部 7 个 operator/algorithm 组合的 p2p transfer multiset 与 `atlahs/goal_gen/ai/nccl_generator_v2` 参考实现比较；
 - 除固定 Simple 的 AllToAll 外，对每个组合分别验证 Simple、LL、LL128，共 19 个 Atlas 对照项。
@@ -241,11 +265,20 @@ python3 tools/compare_atlas_lowering.py --atlas-root ../atlahs
 产出的 `workload.bin` 可直接作为现有 HTSim 命令的 `-goal` 参数：
 
 ```bash
-../HTSIM/htsim/sim/datacenter/htsim_uec \
+../HTSIM/htsim/sim/build/datacenter/htsim_uec \
   -topo <topology-file> \
   -goal outputs/collective_three_branches/workload.bin \
   -nodes 4 <other-htsim-options>
 ```
 
 `world_size`/`-nodes` 和 topology 可容纳的 host 数需要彼此一致。
+
+Dragonfly/DF 后端也可直接消费同一个 binary；以下命令已用于验证 delay 示例：
+
+```bash
+../HTSIM/htsim/sim/build/datacenter/htsim_uec_df \
+  -basepath ../HTSIM/htsim/sim/datacenter/topologies/dragonfly/p2a4h2 \
+  -goal outputs/collective_with_delay/workload.bin \
+  -routing MINIMAL -q 88
+```
 

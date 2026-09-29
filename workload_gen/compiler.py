@@ -49,8 +49,8 @@ class Compiler:
         for node in topological_nodes(self.spec):
             node_id = node["id"]
             op = node.get("op")
-            if op in {"compute", "sink", "barrier"}:
-                spans = self._compile_compute(node)
+            if op in {"compute", "delay", "sink", "barrier"}:
+                spans = self._compile_local_calc(node)
             elif self.kind == "flow" and op == "flow":
                 spans = self._compile_direct_flow(node)
             elif self.kind == "collective" and op in {
@@ -65,9 +65,9 @@ class Compiler:
                 spans = self._compile_collective(node)
             else:
                 supported = (
-                    "compute/sink/barrier/flow"
+                    "compute/delay/sink/barrier/flow"
                     if self.kind == "flow"
-                    else "compute/sink/barrier/alltoall/allreduce/allgather/reduce_scatter/reduce/broadcast"
+                    else "compute/delay/sink/barrier/alltoall/allreduce/allgather/reduce_scatter/reduce/broadcast"
                 )
                 raise ValueError(f"node {node_id}: unsupported op {op!r}; supported: {supported}")
 
@@ -110,7 +110,7 @@ class Compiler:
             raise ValueError(f"node {node['id']}: cpu and nic must fit uint8")
         return cpu, nic
 
-    def _compile_compute(self, node: dict[str, Any]) -> dict[int, Span]:
+    def _compile_local_calc(self, node: dict[str, Any]) -> dict[int, Span]:
         ranks = self._ranks(node)
         cpu, _ = self._cpu_nic(node)
         duration = node.get("duration_ns", 0)

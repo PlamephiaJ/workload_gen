@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import subprocess
 import tempfile
 import unittest
@@ -10,6 +10,7 @@ from pathlib import Path
 from workload_gen.cli import _verify_with_txt2bin
 from workload_gen.compiler import compile_spec
 from workload_gen.goal_io import validate_goal_binary, write_goal_binary, write_goal_text
+from workload_gen.model import OpType
 from workload_gen.spec import load_spec
 
 
@@ -74,6 +75,67 @@ class WorkloadGenerationTests(unittest.TestCase):
             self.assertEqual(flow["bytes"], flow["wire_bytes"])
             if flow["protocol"] in {"ll", "ll128"}:
                 self.assertEqual(flow["wire_bytes"] % 8, 0)
+
+    def test_delay_nodes_lower_to_rank_local_calc(self) -> None:
+        cases = [
+            (
+                "flow",
+                [
+                    {"id": "transfer", "op": "flow", "src": 0, "dst": 1, "bytes": 32},
+                    {
+                        "id": "pause",
+                        "op": "delay",
+                        "ranks": [1],
+                        "duration_ns": 75,
+                        "depends_on": ["transfer"],
+                    },
+                ],
+                {1: 75},
+            ),
+            (
+                "collective",
+                [
+                    {
+                        "id": "exchange",
+                        "op": "allreduce",
+                        "algorithm": "ring",
+                        "ranks": "all",
+                        "bytes": 32,
+                    },
+                    {
+                        "id": "pause",
+                        "op": "delay",
+                        "ranks": "all",
+                        "duration_ns": {"0": 75, "1": 125},
+                        "depends_on": ["exchange"],
+                    },
+                ],
+                {0: 75, 1: 125},
+            ),
+        ]
+        for kind, nodes, expected in cases:
+            with self.subTest(kind=kind):
+                workload = compile_spec(
+                    {
+                        "schema_version": 1,
+                        "kind": kind,
+                        "name": f"{kind}_delay",
+                        "world_size": 2,
+                        "nodes": nodes,
+                    }
+                )
+                for rank, duration in expected.items():
+                    tasks = [task for task in workload.ranks[rank].tasks if task.label == "pause"]
+                    self.assertEqual(len(tasks), 1)
+                    self.assertEqual(tasks[0].op_type, OpType.CALC)
+                    self.assertEqual(tasks[0].size, duration)
+                    self.assertTrue(tasks[0].dependencies)
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    binary = Path(temp_dir) / "workload.bin"
+                    write_goal_binary(workload, binary)
+                    stats = validate_goal_binary(binary)
+                    self.assertEqual(stats["ranks"], 2)
 
     def test_atlas_unsupported_combinations_are_rejected(self) -> None:
         base = {
