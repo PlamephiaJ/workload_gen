@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "kind": "flow",
+  "name": "exp1_1_delay_critical_10us",
+  "world_size": 6,
+  "defaults": {
+    "cpu": 0,
+    "nic": 0,
+    "chunk_bytes": 65536
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "op": "compute",
+      "ranks": [0, 1, 2, 3, 4, 5],
+      "duration_ns": 0
+    },
+
+    {
+      "id": "flow_critical",
+      "op": "flow",
+      "src": 0,
+      "dst": 3,
+      "bytes": 65536,
+      "tag": 101,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "critical_injected_delay",
+      "op": "delay",
+      "ranks": [3],
+      "duration_ns": 10000,
+      "depends_on": ["flow_critical"]
+    },
+    {
+      "id": "critical_tail",
+      "op": "compute",
+      "ranks": [3],
+      "duration_ns": 30000,
+      "depends_on": ["critical_injected_delay"]
+    },
+
+    {
+      "id": "flow_medium",
+      "op": "flow",
+      "src": 1,
+      "dst": 4,
+      "bytes": 65536,
+      "tag": 201,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "medium_tail",
+      "op": "compute",
+      "ranks": [4],
+      "duration_ns": 15000,
+      "depends_on": ["flow_medium"]
+    },
+
+    {
+      "id": "flow_slack",
+      "op": "flow",
+      "src": 2,
+      "dst": 5,
+      "bytes": 65536,
+      "tag": 301,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "slack_tail",
+      "op": "compute",
+      "ranks": [5],
+      "duration_ns": 0,
+      "depends_on": ["flow_slack"]
+    },
+
+    {
+      "id": "sink",
+      "op": "sink",
+      "ranks": [3, 4, 5],
+      "duration_ns": 0,
+      "depends_on": [
+        "critical_tail",
+        "medium_tail",
+        "slack_tail"
+      ]
+    }
+  ]
+}
