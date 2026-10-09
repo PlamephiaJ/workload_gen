@@ -19,6 +19,7 @@
     {
       "id": "flow_critical",
       "op": "flow",
+      "flow_id": 0,
       "src": 0,
       "dst": 3,
       "bytes": 65536,
@@ -36,6 +37,7 @@
     {
       "id": "flow_medium",
       "op": "flow",
+      "flow_id": 1,
       "src": 1,
       "dst": 4,
       "bytes": 65536,
@@ -53,6 +55,7 @@
     {
       "id": "flow_slack",
       "op": "flow",
+      "flow_id": 2,
       "src": 2,
       "dst": 5,
       "bytes": 65536,
@@ -61,10 +64,9 @@
     },
     {
       "id": "slack_injected_delay",
-      "op": "delay",
-      "ranks": [5],
-      "duration_ns": 35000,
-      "depends_on": ["flow_slack"]
+      "op": "flow_delay",
+      "flow_id": 2,
+      "duration_ns": 35000
     },
     {
       "id": "slack_tail",

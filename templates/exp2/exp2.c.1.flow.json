@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "kind": "flow",
+  "name": "exp2.c.1.flow",
+  "world_size": 12,
+  "extends": "exp2.a.1.flow.json",
+  "expectation": {
+    "case": "Tree flow 35 +2 us",
+    "baseline_cct_us": 50.952,
+    "perturbed_cct_us": 52.952,
+    "delta_cct_us": 2.0
+  },
+  "nodes": [
+    {
+      "id": "flow_35_delay_2us",
+      "op": "flow_delay",
+      "flow_id": 35,
+      "duration_ns": 2000
+    }
+  ]
+}

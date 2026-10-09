@@ -2,8 +2,8 @@
 
 这个目录提供一个独立的、声明式的 GOAL workload 生成器。输入可以是：
 
-- collective 级 DAG：可在 collective 之间混合 compute/delay/sink/barrier 节点，并覆盖 Atlas 当前实现的全部 collective/operator/algorithm 组合；collective 先 lowering 成成对的 p2p send/recv，再与本地节点一起写入 GOAL binary，并输出完整 flow metadata。
-- p2p flow 级 DAG：直接指定 flow、compute、delay 与依赖关系，直接写 GOAL binary；不生成 collective metadata。
+- collective 级 DAG：可在 collective 之间混合 compute/collective_delay/sink/barrier 节点，并覆盖 Atlas 当前实现的全部 collective/operator/algorithm 组合；collective 先 lowering 成成对的 p2p send/recv，再与本地节点一起写入 GOAL binary，并输出完整 flow metadata 和等价 flow DAG template。
+- p2p flow 级 DAG：直接指定 flow、compute、flow_delay 与依赖关系，再写 GOAL binary。`flow_delay` 只按唯一 `flow_id` 选择目标。
 
 生成器不依赖 Atlas 或第三方 Python 包。它直接实现 Atlas/LogGOPSim 使用的 GOAL binary 格式，也保留一份可读的 `workload.goal` 便于检查。
 
@@ -31,10 +31,12 @@ outputs/
 ├── collective_three_branches/
 │   ├── workload.bin
 │   ├── workload.goal
-│   └── workload.meta.json
+│   ├── workload.meta.json
+│   └── collective_three_branches.flow.json
 ├── flow_three_branches/
 │   ├── workload.bin
-│   └── workload.goal
+│   ├── workload.goal
+│   └── workload.meta.json
 └── collective_with_delay/
     ├── workload.bin
     ├── workload.goal
@@ -69,6 +71,7 @@ python3 generate.py templates/flow_dag.json --no-goal-text
 - `world_size`: GOAL rank 数。
 - `defaults`: 可选的 `cpu`、`nic`、`chunk_bytes` 等默认值。
 - `nodes`: 高层 DAG 节点；`depends_on` 指定前驱。
+- `extends`: 可选的相对路径；继承基础模板并把当前 `nodes` 追加到基础 DAG。用于从同一 flow baseline 派生单一 perturbation template。
 
 GOAL 的依赖是 rank-local 的。因此一条高层依赖边的两端必须至少共享一个 rank；编译器会拒绝无法投影到任何 rank 的边。
 
@@ -77,40 +80,72 @@ GOAL 的依赖是 rank-local 的。因此一条高层依赖边的两端必须至
 `flow` 节点字段：
 
 - `src`, `dst`, `bytes`: 源、目的和字节数。
+- `flow_id`: 可选的显式唯一 ID；`flow_delay` 必须通过该 ID 引用目标 flow。
 - `tag`: 可选；省略时自动生成。显式 tag 加分块时，第 `i` 块使用 `tag + i`。
 - `chunk_bytes`: 可选；flow 大于该值时拆为多个有序消息。
 - `cpu`, `nic`: 可选，范围 `0..255`。
 
-`compute`、`delay`、`sink` 和 `barrier` 都是本地计算节点，使用 `ranks` 与 `duration_ns`。`ranks` 可以是 `"all"` 或 rank 数组。`duration_ns` 可为一个整数，也可为按 rank 给值的对象。
+`compute`、`sink` 和 `barrier` 是普通本地计算节点，使用 `ranks` 与 `duration_ns`。
+
+`flow_delay` 是 flow DAG 专用节点，不允许出现在 collective DAG 中。它直接按
+`flow_id` 定位目标，将 destination rank 上原本从 recv 指向后继的依赖改为
+`recv -> flow_delay -> successors`：
+
+```json
+{
+  "id": "flow_35_delay_2us",
+  "op": "flow_delay",
+  "flow_id": 35,
+  "duration_ns": 2000
+}
+```
 
 ### Collective DAG
 
-Collective DAG 不只能包含通信算子，也支持 `compute`、`delay`、`sink` 和 `barrier` 本地节点。这四种节点的字段相同：
+Collective DAG 不只能包含通信算子，也支持 `compute`、`collective_delay`、`sink` 和 `barrier` 本地节点。这四种节点的字段相同：
 
 - `ranks`: 执行该节点的 GOAL rank，可为 `"all"` 或非空 rank 数组，例如 `[0, 2]`。
 - `duration_ns`: 本地计算时间，可为所有 rank 共用的非负整数，也可为按 rank 设置的对象，例如 `{"0": 1000, "1": 1500}`。
 - `cpu`: 可选 GOAL CPU ID；省略时使用 `defaults.cpu` 或 `0`。
 - `depends_on`: 前驱节点 ID 数组。依赖按共有 rank 投影：每个本地节点会等待同一 rank 上的前驱 collective lowering 完成。
 
-`compute`、`delay`、`sink` 和 `barrier` 都会生成 GOAL `calc` 任务，不会 lowering 成网络 flow。`sink` 通常使用 `duration_ns: 0` 来汇合多个分支。`barrier` 是用于表达依赖的 rank-local anchor；它不会隐式增加跨 rank 同步，所有前驱都需要在 `depends_on` 中显式列出。
+`compute`、`collective_delay`、`sink` 和 `barrier` 都会生成 GOAL `calc` 任务，不会 lowering 成网络 flow。`sink` 通常使用 `duration_ns: 0` 来汇合多个分支。`barrier` 是用于表达依赖的 rank-local anchor；它不会隐式增加跨 rank 同步，所有前驱都需要在 `depends_on` 中显式列出。
 
 #### Delay 节点
 
-`delay` 专门表达计算图中的等待、软件开销或其他不产生通信的中间延迟。它与 `compute` 使用相同的 GOAL `calc` 表示，因此 HTSim 会推进对应 rank 的时间，但不会创建 p2p flow。Collective workload 的 `workload.meta.json` 会在 `source_graph.nodes` 中保留原始 `op: "delay"`，便于区分它与普通计算。
+`collective_delay` 专门表达 collective DAG 节点之间的等待、软件开销或其他不产生通信的中间延迟。它与 `compute` 使用相同的 GOAL `calc` 表示，但不能按 collective 内部的 src/dst 或 flow 定位。
 
 ```json
 {
   "id": "between_stages",
-  "op": "delay",
+  "op": "collective_delay",
   "ranks": "all",
   "duration_ns": 5000,
   "depends_on": ["allreduce"]
 }
 ```
 
-`duration_ns` 也可以按 rank 指定，例如 `{"0": 5000, "1": 6500}`。delay 只等待与自己共享 rank 的前驱；如果一条边两端没有任何共同 rank，编译器会报错。
+`duration_ns` 也可以按 rank 指定，例如 `{"0": 5000, "1": 6500}`。`collective_delay` 只等待与自己共享 rank 的前驱；如果一条边两端没有任何共同 rank，编译器会报错。
 
-完整的 `collective -> delay -> collective -> sink` 可运行示例见 `templates/delay_dag.json`。
+完整的 `collective -> collective_delay -> collective -> sink` 可运行示例见
+`templates/delay_dag.json`。需要对内部通信注入 `flow_delay` 时，必须先使用 lowering
+输出的 flow template，再从该 flow template 派生 perturbation；两种 delay 不允许跨
+DAG 粒度混用。
+
+### Collective → flow template
+
+输入为 collective DAG 时，每次正常生成都会额外在输出目录写入同逻辑的
+`<name>.flow.json`。也可以用 `--flow-template-output` 把它写到指定模板路径：
+
+```bash
+python3 generate.py templates/exp2/exp2.a.1.collective.json \
+  --flow-template-output templates/exp2/exp2.a.1.flow.json
+```
+
+collective lowering 为生成的 P2P flow 分配 `flow_id`，导出的 flow DAG 直接使用这些
+ID，不进行第二次编号；同时用 endpoint-specific `rank_depends_on` 精确保留 lowering
+后 send、recv 和本地 calc 的依赖。推荐文件名统一使用
+`<experiment>.collective.json` 和 `<experiment>.flow.json` 表示 DAG 粒度。
 
 一个 `collective -> compute -> sink` 示例：
 
@@ -247,7 +282,8 @@ python3 -m unittest discover -s tests -v
 测试包括：
 
 - binary round-trip、依赖计数、DAG 无环性与 send/recv 完整匹配；
-- `delay` 在 flow 与 collective DAG 中的 rank-local lowering、时长和依赖；
+- `collective_delay` 与 `flow_delay` 的粒度隔离、rank-local lowering、时长和依赖；
+- collective DAG 到等价 flow DAG template 的 task/edge/flow 一致性；
 - 原生 Python writer 与 Atlas `txt2bin` 的逐字节比较；
 - 全部 7 个 operator/algorithm 组合的 p2p transfer multiset 与 `atlahs/goal_gen/ai/nccl_generator_v2` 参考实现比较；
 - 除固定 Simple 的 AllToAll 外，对每个组合分别验证 Simple、LL、LL128，共 19 个 Atlas 对照项。

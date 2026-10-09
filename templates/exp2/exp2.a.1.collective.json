@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "kind": "collective",
+  "name": "exp2.a.1.collective",
+  "world_size": 12,
+  "defaults": {
+    "cpu": 0,
+    "nic": 0,
+    "chunk_bytes": 65536
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "op": "compute",
+      "ranks": "all",
+      "duration_ns": 0
+    },
+    {
+      "id": "ring_allreduce",
+      "op": "allreduce",
+      "algorithm": "ring",
+      "protocol": "simple",
+      "ranks": [0, 1, 2, 3],
+      "bytes": 262144,
+      "channels": 1,
+      "ring_orders": [[0, 1, 2, 3]],
+      "depends_on": ["start"]
+    },
+    {
+      "id": "tree_allreduce",
+      "op": "allreduce",
+      "algorithm": "tree",
+      "protocol": "simple",
+      "ranks": [4, 5, 6, 7],
+      "bytes": 262144,
+      "chunk_bytes": 65536,
+      "tree_parent": {
+        "4": null,
+        "5": 4,
+        "6": 4,
+        "7": 5
+      },
+      "depends_on": ["start"]
+    },
+    {
+      "id": "direct_alltoall",
+      "op": "alltoall",
+      "algorithm": "direct",
+      "ranks": [8, 9, 10, 11],
+      "bytes_per_peer": 65536,
+      "chunk_bytes": 65536,
+      "depends_on": ["start"]
+    },
+    {
+      "id": "sink",
+      "op": "sink",
+      "ranks": "all",
+      "duration_ns": 0,
+      "depends_on": ["ring_allreduce", "tree_allreduce", "direct_alltoall"]
+    }
+  ]
+}

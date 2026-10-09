@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "kind": "flow",
+  "name": "exp2.c.2.flow",
+  "world_size": 12,
+  "extends": "exp2.a.1.flow.json",
+  "expectation": {
+    "case": "A2A flow 59 +2 us",
+    "baseline_cct_us": 50.952,
+    "perturbed_cct_us": 50.952,
+    "delta_cct_us": 0.0
+  },
+  "nodes": [
+    {
+      "id": "flow_59_delay_2us",
+      "op": "flow_delay",
+      "flow_id": 59,
+      "duration_ns": 2000
+    }
+  ]
+}

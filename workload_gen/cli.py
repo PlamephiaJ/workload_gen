@@ -11,6 +11,7 @@ from typing import Sequence
 from . import __version__
 from .compiler import compile_spec
 from .goal_io import validate_goal_binary, write_goal_binary, write_goal_text
+from .lowering import lower_collective_to_flow_spec
 from .spec import load_spec
 
 
@@ -30,6 +31,11 @@ def _parser() -> argparse.ArgumentParser:
         help="root directory; a workload-name subdirectory is created (default: %(default)s)",
     )
     parser.add_argument("--no-goal-text", action="store_true", help="do not keep the readable workload.goal file")
+    parser.add_argument(
+        "--flow-template-output",
+        type=Path,
+        help="for a collective input, also write the lowered flow DAG template to this path",
+    )
     parser.add_argument("--validate-only", action="store_true", help="parse and compile input without writing output")
     parser.add_argument(
         "--verify-with-txt2bin",
@@ -133,10 +139,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if args.no_goal_text:
         goal_path.unlink()
 
-    metadata_path: Path | None = None
+    metadata_path = output_dir / "workload.meta.json"
+    _write_metadata(spec, workload, metadata_path, stats, goal_text_present=not args.no_goal_text)
+
+    flow_template_path: Path | None = None
     if workload.source_kind == "collective":
-        metadata_path = output_dir / "workload.meta.json"
-        _write_metadata(spec, workload, metadata_path, stats, goal_text_present=not args.no_goal_text)
+        flow_spec = lower_collective_to_flow_spec(spec, workload)
+        flow_template_path = output_dir / f"{flow_spec['name']}.json"
+        rendered = json.dumps(flow_spec, indent=2, sort_keys=False) + "\n"
+        flow_template_path.write_text(rendered, encoding="utf-8")
+        if args.flow_template_output:
+            requested = args.flow_template_output.expanduser().resolve()
+            requested.parent.mkdir(parents=True, exist_ok=True)
+            requested.write_text(rendered, encoding="utf-8")
 
     return {
         "status": "generated",
@@ -145,7 +160,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "output_dir": str(output_dir),
         "binary": str(binary_path),
         "goal_text": None if args.no_goal_text else str(goal_path),
-        "metadata": str(metadata_path) if metadata_path else None,
+        "metadata": str(metadata_path),
+        "flow_template": str(flow_template_path) if flow_template_path else None,
         "verified_with_txt2bin": verified_with,
         **stats,
     }

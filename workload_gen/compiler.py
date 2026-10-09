@@ -42,6 +42,7 @@ class Compiler:
         self.next_flow_id = as_nonnegative_int(spec.get("flow_id_start", 0), "flow_id_start")
         self.message_sequence: defaultdict[tuple[int, int, int], int] = defaultdict(int)
         self.used_message_keys: set[tuple[int, int, int]] = set()
+        self.used_flow_ids: set[int] = set()
         self.used_collective_ids: set[int] = set()
         self.next_collective_id = 0
 
@@ -49,7 +50,15 @@ class Compiler:
         for node in topological_nodes(self.spec):
             node_id = node["id"]
             op = node.get("op")
-            if op in {"compute", "delay", "sink", "barrier"}:
+            if op == "flow_delay":
+                if self.kind != "flow":
+                    raise ValueError(f"node {node_id}: flow_delay is only valid in a flow DAG")
+                spans = self._compile_flow_delay(node)
+            elif op == "collective_delay":
+                if self.kind != "collective":
+                    raise ValueError(f"node {node_id}: collective_delay is only valid in a collective DAG")
+                spans = self._compile_local_calc(node)
+            elif op in {"compute", "sink", "barrier"}:
                 spans = self._compile_local_calc(node)
             elif self.kind == "flow" and op == "flow":
                 spans = self._compile_direct_flow(node)
@@ -65,9 +74,10 @@ class Compiler:
                 spans = self._compile_collective(node)
             else:
                 supported = (
-                    "compute/delay/sink/barrier/flow"
+                    "compute/flow_delay/sink/barrier/flow"
                     if self.kind == "flow"
-                    else "compute/delay/sink/barrier/alltoall/allreduce/allgather/reduce_scatter/reduce/broadcast"
+                    else "compute/collective_delay/sink/barrier/"
+                    "alltoall/allreduce/allgather/reduce_scatter/reduce/broadcast"
                 )
                 raise ValueError(f"node {node_id}: unsupported op {op!r}; supported: {supported}")
 
@@ -79,6 +89,17 @@ class Compiler:
                         f"edge {dependency} -> {node_id} has no shared rank; GOAL dependencies are rank-local"
                     )
                 for rank in shared_ranks:
+                    self.graphs[rank].require(spans[rank].start, predecessor_spans[rank].end)
+            for raw_rank, dependencies in node.get("rank_depends_on", {}).items():
+                rank = as_nonnegative_int(int(raw_rank), f"node {node_id}.rank_depends_on rank")
+                if rank not in spans:
+                    raise ValueError(f"node {node_id}: rank_depends_on rank {rank} is not part of the node")
+                for dependency in dependencies:
+                    predecessor_spans = self.spans[dependency]
+                    if rank not in predecessor_spans:
+                        raise ValueError(
+                            f"node {node_id}: rank_depends_on predecessor {dependency} has no rank {rank}"
+                        )
                     self.graphs[rank].require(spans[rank].start, predecessor_spans[rank].end)
             self.spans[node_id] = spans
 
@@ -153,6 +174,7 @@ class Compiler:
         nic: int,
         context: int | None = None,
         explicit_tag: int | None = None,
+        explicit_flow_id: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> FlowHandle:
         if src == dst:
@@ -176,25 +198,32 @@ class Compiler:
             raise ValueError(f"duplicate message key src={src}, dst={dst}, tag={tag}")
         self.used_message_keys.add(message_key)
 
-        flow_id = self.next_flow_id
-        self.next_flow_id += 1
+        if explicit_flow_id is None:
+            while self.next_flow_id in self.used_flow_ids:
+                self.next_flow_id += 1
+            flow_id = self.next_flow_id
+            self.next_flow_id += 1
+        else:
+            flow_id = as_nonnegative_int(explicit_flow_id, "flow_id")
+        if flow_id in self.used_flow_ids:
+            raise ValueError(f"duplicate flow_id {flow_id}")
+        self.used_flow_ids.add(flow_id)
         send = self.graphs[src].add_send(dst, size, tag, cpu=cpu, nic=nic, label=f"flow:{flow_id}:send")
         recv = self.graphs[dst].add_recv(src, size, tag, cpu=cpu, nic=nic, label=f"flow:{flow_id}:recv")
-        if self.kind == "collective":
-            record = dict(metadata or {})
-            record.update(
-                {
-                    "flow_id": flow_id,
-                    "src": src,
-                    "dst": dst,
-                    "bytes": size,
-                    "tag": tag,
-                    "message_sequence": sequence,
-                    "send_task": {"rank": src, "task_id": send},
-                    "recv_task": {"rank": dst, "task_id": recv},
-                }
-            )
-            self.flows[flow_id] = record
+        record = dict(metadata or {})
+        record.update(
+            {
+                "flow_id": flow_id,
+                "src": src,
+                "dst": dst,
+                "bytes": size,
+                "tag": tag,
+                "message_sequence": sequence,
+                "send_task": {"rank": src, "task_id": send},
+                "recv_task": {"rank": dst, "task_id": recv},
+            }
+        )
+        self.flows[flow_id] = record
         return FlowHandle(flow_id, src, dst, send, recv)
 
     def _compile_direct_flow(self, node: dict[str, Any]) -> dict[int, Span]:
@@ -202,6 +231,27 @@ class Compiler:
         dst = as_nonnegative_int(node.get("dst"), f"node {node['id']}.dst")
         size = as_nonnegative_int(node.get("bytes"), f"node {node['id']}.bytes")
         cpu, nic = self._cpu_nic(node)
+        if node.get("lowered", False):
+            if node.get("lowered") is not True:
+                raise ValueError(f"node {node['id']}.lowered must be boolean")
+            metadata = node.get("metadata", {})
+            if not isinstance(metadata, dict):
+                raise ValueError(f"node {node['id']}.metadata must be an object")
+            handle = self._add_flow(
+                src,
+                dst,
+                size,
+                cpu=cpu,
+                nic=nic,
+                explicit_tag=node.get("tag"),
+                explicit_flow_id=node.get("flow_id"),
+                metadata={**metadata, "dag_node_id": node["id"]},
+            )
+            return {
+                src: Span(handle.send_task, handle.send_task),
+                dst: Span(handle.recv_task, handle.recv_task),
+            }
+
         maximum = as_nonnegative_int(self._value(node, "chunk_bytes", max(1, size)), "chunk_bytes", positive=True)
         pieces = _chunk_bytes(size, maximum)
         spans = self._new_anchors(node["id"], [src, dst], cpu)
@@ -217,6 +267,8 @@ class Compiler:
                 cpu=cpu,
                 nic=nic,
                 explicit_tag=(base_tag + chunk if base_tag is not None else None),
+                explicit_flow_id=(node.get("flow_id") + chunk if node.get("flow_id") is not None else None),
+                metadata={"node_id": node["id"]},
             )
             self.graphs[src].require(handle.send_task, previous[src])
             self.graphs[dst].require(handle.recv_task, previous[dst])
@@ -318,6 +370,40 @@ class Compiler:
         else:
             raise AssertionError(f"unhandled collective op: {op}")
         self.collectives.append(descriptor)
+        return spans
+
+    def _compile_flow_delay(self, node: dict[str, Any]) -> dict[int, Span]:
+        flow_id = as_nonnegative_int(node.get("flow_id"), f"node {node['id']}.flow_id")
+        flow = self.flows.get(flow_id)
+        if flow is None:
+            raise ValueError(f"node {node['id']}: unknown or not-yet-compiled flow_id {flow_id}")
+        if "post_delay" in flow:
+            raise ValueError(f"node {node['id']}: flow {flow_id} already has a flow_delay")
+        recv_rank = flow["recv_task"]["rank"]
+        local_node = {**node, "ranks": [recv_rank]}
+        spans = self._compile_local_calc(local_node)
+        delay_task = spans[recv_rank].start
+        recv_task = flow["recv_task"]["task_id"]
+        graph = self.graphs[recv_rank]
+
+        # Put the delay directly on the receive-completion edge: every
+        # existing local successor now waits for the delay instead of the
+        # recv task, while the delay itself waits for that recv task.
+        for task in graph.tasks[:-1]:
+            if recv_task in task.dependencies:
+                task.dependencies.remove(recv_task)
+                task.dependencies.add(delay_task)
+        graph.require(delay_task, recv_task)
+        flow["post_delay"] = {
+            "node_id": node["id"],
+            "duration_ns": graph.tasks[delay_task].size,
+            "rank": recv_rank,
+            "task_id": delay_task,
+        }
+        flow_node_id = flow.get("dag_node_id")
+        if flow_node_id in self.spans:
+            original = self.spans[flow_node_id][recv_rank]
+            self.spans[flow_node_id][recv_rank] = Span(original.start, delay_task)
         return spans
 
     def _flow_meta(

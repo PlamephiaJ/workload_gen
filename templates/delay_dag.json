@@ -28,7 +28,7 @@
     },
     {
       "id": "between_stages",
-      "op": "delay",
+      "op": "collective_delay",
       "ranks": "all",
       "duration_ns": {
         "0": 5000,
