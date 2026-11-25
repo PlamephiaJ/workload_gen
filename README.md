@@ -265,7 +265,13 @@ Collective 可设置 `collective_id`、`context` 和 `ordering_domain`。自动 
 tag = per_(src,dst,context)_message_sequence * 100000 + context
 ```
 
-`workload.meta.json` 的每个 flow 保存 `collective_id`、collective type、algorithm、phase、chunk、step、channel、ordering domain、src/dst、bytes、tag/message sequence，以及 send/recv 在各 rank 中的 task ID。
+`workload.meta.json` 中由 collective lowering 生成的每条 flow 都带有 `(dag_id, collective_id, comm_position)`。`dag_id` 来自模板顶层字段，默认是 `0`。`comm_position` 从 `0` 开始编号，导出为 flow 模板时也会保留。
+
+- Tree AllReduce 按树的依赖为 reduce 边和 broadcast 边编号，同一条边在各 chunk 中复用编号。
+- Ring 按 channel、phase、step 和该步中的有向通信边编号，同一通信位置在各 piece 中复用编号。
+- Direct AllToAll 按有向 peer 对编号，各 chunk 复用同一对的编号。
+
+多个迭代可以为同一通信模板指定相同的 `collective_id`，并为每次调用指定唯一的 `collective_instance_id`。实例 ID 同时决定默认的 `context` 和 `ordering_domain`。可选的 `iteration` 会写入 metadata。每条 flow 还记录 collective type、algorithm、phase、chunk、step、channel、ordering domain、src/dst、bytes、tag/message sequence，以及 send/recv 在各 rank 中的 task ID。
 
 协议 lowering 后还会记录 `protocol`、原始 `payload_bytes` 和实际 `wire_bytes`。
 

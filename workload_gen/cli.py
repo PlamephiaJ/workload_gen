@@ -98,6 +98,7 @@ def _write_metadata(
             "name": workload.name,
             "kind": workload.source_kind,
             "world_size": workload.world_size,
+            "dag_id": spec.get("dag_id", 0),
             "binary": "workload.bin",
             "goal_text": "workload.goal" if goal_text_present else None,
             "tasks": stats["tasks"],

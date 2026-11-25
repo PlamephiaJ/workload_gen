@@ -49,6 +49,8 @@ class WorkloadGenerationTests(unittest.TestCase):
         self.assertEqual(phases, {"exchange", "reduce_scatter", "allgather", "reduce", "broadcast"})
         for flow in workload.flows.values():
             self.assertIn("collective_id", flow)
+            self.assertEqual(flow["dag_id"], 0)
+            self.assertIn("comm_position", flow)
             self.assertIn("ordering_domain", flow)
             self.assertIn("send_task", flow)
             self.assertIn("recv_task", flow)
@@ -76,6 +78,44 @@ class WorkloadGenerationTests(unittest.TestCase):
             self.assertEqual(flow["bytes"], flow["wire_bytes"])
             if flow["protocol"] in {"ll", "ll128"}:
                 self.assertEqual(flow["wire_bytes"] % 8, 0)
+
+    def test_comm_positions_repeat_across_chunks_and_iterations(self) -> None:
+        spec = load_spec(ROOT / "templates" / "collective_all_supported.json")
+        spec["dag_id"] = 17
+        nodes = [node for node in spec["nodes"] if "collective_id" in node]
+        spec["nodes"] = []
+        for iteration in (0, 1):
+            for node in nodes:
+                instance = {**node, "id": f"{node['id']}_{iteration}", "depends_on": [],
+                            "collective_instance_id": node["collective_id"] + 100 * iteration,
+                            "iteration": iteration, "chunk_bytes": 256}
+                if node["algorithm"] == "ring":
+                    instance.update(channels=2, ring_orders=[[0, 1, 2, 3], [0, 3, 2, 1]])
+                if node["algorithm"] == "tree":
+                    instance["tree_parent"] = {"0": None, "1": 0, "2": 1, "3": 0}
+                spec["nodes"].append(instance)
+
+        workload = compile_spec(spec)
+        lowered = compile_spec(lower_collective_to_flow_spec(spec, workload))
+        by_iteration = [{}, {}]
+        for flow_id, flow in workload.flows.items():
+            position = flow["comm_position"]
+            self.assertEqual((flow["dag_id"], lowered.flows[flow_id]["dag_id"]), (17, 17))
+            self.assertEqual(lowered.flows[flow_id]["comm_position"], position)
+            self.assertEqual(flow["tag"] % 100_000, flow["collective_instance_id"])
+            positions = by_iteration[flow["iteration"]].setdefault(flow["collective_id"], {})
+            role = tuple(flow[field] for field in ("phase", "channel", "step", "src", "dst"))
+            self.assertEqual(positions.setdefault(position, role), role)
+
+        self.assertEqual(by_iteration[0], by_iteration[1])
+        self.assertEqual([len(positions) for positions in by_iteration[0].values()], [12, 48, 6, 24, 24, 6, 6])
+        for positions in by_iteration[0].values():
+            self.assertEqual(set(positions), set(range(len(positions))))
+        tree = by_iteration[0][102]
+        self.assertEqual([(tree[pos][0], *tree[pos][-2:]) for pos in range(6)], [
+            ("reduce", 2, 1), ("reduce", 1, 0), ("reduce", 3, 0),
+            ("broadcast", 0, 3), ("broadcast", 0, 1), ("broadcast", 1, 2),
+        ])
 
     def test_delay_nodes_lower_to_rank_local_calc(self) -> None:
         cases = [

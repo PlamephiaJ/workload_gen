@@ -114,6 +114,7 @@ def lower_collective_to_flow_spec(
         "kind": "flow",
         "name": name or _flow_template_name(source_spec["name"]),
         "world_size": workload.world_size,
+        "dag_id": source_spec.get("dag_id", 0),
         "defaults": source_spec.get("defaults", {}),
         "lowered_from": {
             "name": source_spec["name"],

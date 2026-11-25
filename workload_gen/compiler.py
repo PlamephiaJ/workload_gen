@@ -34,6 +34,9 @@ class Compiler:
         self.spec = spec
         self.kind = spec["kind"]
         self.world_size = spec["world_size"]
+        self.dag_id = as_nonnegative_int(spec.get("dag_id", 0), "dag_id")
+        if self.dag_id > 0xFFFFFFFFFFFFFFFF:
+            raise ValueError("dag_id must fit uint64")
         self.defaults = spec.get("defaults", {})
         self.graphs = [RankGraph(rank) for rank in range(self.world_size)]
         self.spans: dict[str, dict[int, Span]] = {}
@@ -43,8 +46,8 @@ class Compiler:
         self.message_sequence: defaultdict[tuple[int, int, int], int] = defaultdict(int)
         self.used_message_keys: set[tuple[int, int, int]] = set()
         self.used_flow_ids: set[int] = set()
-        self.used_collective_ids: set[int] = set()
-        self.next_collective_id = 0
+        self.used_collective_instance_ids: set[int] = set()
+        self.next_collective_instance_id = 0
 
     def compile(self) -> Workload:
         for node in topological_nodes(self.spec):
@@ -237,6 +240,9 @@ class Compiler:
             metadata = node.get("metadata", {})
             if not isinstance(metadata, dict):
                 raise ValueError(f"node {node['id']}.metadata must be an object")
+            metadata = {**metadata, "dag_node_id": node["id"]}
+            if "collective_id" in metadata:
+                metadata["dag_id"] = self.dag_id
             handle = self._add_flow(
                 src,
                 dst,
@@ -245,7 +251,7 @@ class Compiler:
                 nic=nic,
                 explicit_tag=node.get("tag"),
                 explicit_flow_id=node.get("flow_id"),
-                metadata={**metadata, "dag_node_id": node["id"]},
+                metadata=metadata,
             )
             return {
                 src: Span(handle.send_task, handle.send_task),
@@ -278,22 +284,26 @@ class Compiler:
             self.graphs[rank].require(spans[rank].end, previous[rank])
         return spans
 
-    def _collective_identity(self, node: dict[str, Any]) -> tuple[int, int, int]:
-        if "collective_id" in node:
-            collective_id = as_nonnegative_int(node["collective_id"], f"node {node['id']}.collective_id")
+    def _collective_identity(self, node: dict[str, Any]) -> tuple[int, int, int, int]:
+        if "collective_instance_id" in node:
+            instance_id = as_nonnegative_int(node["collective_instance_id"], f"node {node['id']}.collective_instance_id")
+        elif "collective_id" in node:
+            instance_id = as_nonnegative_int(node["collective_id"], f"node {node['id']}.collective_id")
         else:
-            while self.next_collective_id in self.used_collective_ids:
-                self.next_collective_id += 1
-            collective_id = self.next_collective_id
-            self.next_collective_id += 1
-        if collective_id in self.used_collective_ids:
-            raise ValueError(f"duplicate collective_id {collective_id}")
-        self.used_collective_ids.add(collective_id)
-        context = as_nonnegative_int(node.get("context", collective_id), f"node {node['id']}.context")
+            while self.next_collective_instance_id in self.used_collective_instance_ids:
+                self.next_collective_instance_id += 1
+            instance_id = self.next_collective_instance_id
+            self.next_collective_instance_id += 1
+        if instance_id in self.used_collective_instance_ids:
+            field = "collective_instance_id" if "collective_instance_id" in node else "collective_id"
+            raise ValueError(f"duplicate {field} {instance_id}")
+        self.used_collective_instance_ids.add(instance_id)
+        collective_id = as_nonnegative_int(node.get("collective_id", instance_id), f"node {node['id']}.collective_id")
+        context = as_nonnegative_int(node.get("context", instance_id), f"node {node['id']}.context")
         ordering_domain = as_nonnegative_int(
-            node.get("ordering_domain", collective_id), f"node {node['id']}.ordering_domain"
+            node.get("ordering_domain", instance_id), f"node {node['id']}.ordering_domain"
         )
-        return collective_id, context, ordering_domain
+        return collective_id, instance_id, context, ordering_domain
 
     def _protocol(self, node: dict[str, Any]) -> str:
         protocol = str(self._value(node, "protocol", "simple")).lower()
@@ -320,12 +330,16 @@ class Compiler:
         if len(ranks) < 2:
             raise ValueError(f"node {node['id']}: collective requires at least two ranks")
         cpu, nic = self._cpu_nic(node)
-        collective_id, context, ordering_domain = self._collective_identity(node)
+        collective_id, instance_id, context, ordering_domain = self._collective_identity(node)
+        identity = {"dag_id": self.dag_id, "collective_id": collective_id, "collective_instance_id": instance_id}
+        if "iteration" in node:
+            identity["iteration"] = as_nonnegative_int(node["iteration"], f"node {node['id']}.iteration")
+        node = {**node, **identity}
         op = node["op"]
         algorithm = node.get("algorithm", "direct" if op == "alltoall" else "ring")
         protocol = self._protocol(node)
         descriptor = {
-            "collective_id": collective_id,
+            **identity,
             "node_id": node["id"],
             "type": op,
             "algorithm": algorithm,
@@ -416,10 +430,15 @@ class Compiler:
         step: int,
         channel: int,
         ordering_domain: int,
+        *,
+        comm_position: int,
         **extra: Any,
     ) -> dict[str, Any]:
         result = {
+            "dag_id": self.dag_id,
             "collective_id": collective_id,
+            "collective_instance_id": node["collective_instance_id"],
+            "comm_position": comm_position,
             "node_id": node["id"],
             "type": node["op"],
             "algorithm": algorithm,
@@ -429,6 +448,8 @@ class Compiler:
             "channel": channel,
             "ordering_domain": ordering_domain + channel,
         }
+        if "iteration" in node:
+            result["iteration"] = node["iteration"]
         result.update(extra)
         return result
 
@@ -494,10 +515,8 @@ class Compiler:
         spans = self._new_anchors(node["id"], ranks, cpu)
         first_internal = {rank: len(self.graphs[rank].tasks) for rank in ranks}
         handles: dict[tuple[int, int, int], FlowHandle] = {}
-        for src in ranks:
-            for dst in ranks:
-                if src == dst:
-                    continue
+        for index, src in enumerate(ranks):
+            for peer_index, dst in enumerate(rank for rank in ranks if rank != src):
                 for chunk, chunk_size in enumerate(pieces):
                     handles[(src, dst, chunk)] = self._add_collective_flow(
                         node,
@@ -516,6 +535,7 @@ class Compiler:
                             ranks.index(dst),
                             0,
                             ordering_domain,
+                            comm_position=index * (len(ranks) - 1) + peer_index,
                             peer=dst,
                             chunks_per_peer=len(pieces),
                         ),
@@ -576,6 +596,7 @@ class Compiler:
 
         for channel, (order, channel_size) in enumerate(zip(orders, channel_sizes)):
             n = len(order)
+            positions_per_phase = (n - 1) * n
             chunk_sizes = _split_bytes(channel_size, n)
             reduce_flows: dict[tuple[int, int], FlowHandle] = {}
             gather_flows: dict[tuple[int, int], FlowHandle] = {}
@@ -600,6 +621,7 @@ class Compiler:
                             step,
                             channel,
                             ordering_domain,
+                            comm_position=2 * channel * positions_per_phase + step * n + index,
                             chunk_bytes=chunk_sizes[chunk],
                         ),
                     )
@@ -624,6 +646,7 @@ class Compiler:
                             step,
                             channel,
                             ordering_domain,
+                            comm_position=(2 * channel + 1) * positions_per_phase + step * n + index,
                             chunk_bytes=chunk_sizes[chunk],
                         ),
                     )
@@ -716,6 +739,7 @@ class Compiler:
                                 step,
                                 channel,
                                 ordering_domain,
+                                comm_position=(channel * (n - 1) + step) * n + index,
                                 owner_rank=order[owner],
                                 piece=piece,
                                 in_place=in_place,
@@ -793,6 +817,7 @@ class Compiler:
                             step,
                             channel,
                             ordering_domain,
+                            comm_position=(channel * (n - 1) + step) * n + index,
                             owner_rank=order[chunk],
                             chunk_bytes=chunk_sizes[chunk],
                         ),
@@ -868,6 +893,7 @@ class Compiler:
                                 step,
                                 channel,
                                 ordering_domain,
+                                comm_position=channel * (n - 1) + step,
                                 root=root,
                                 piece=piece,
                             ),
@@ -941,6 +967,7 @@ class Compiler:
                                 step,
                                 channel,
                                 ordering_domain,
+                                comm_position=channel * (n - 1) + step,
                                 root=root,
                                 piece=piece,
                             ),
@@ -1008,6 +1035,17 @@ class Compiler:
         for rank, parent in parents.items():
             if parent is not None:
                 children[parent].append(rank)
+        # Number broadcasts parent before child, and reductions in reverse.
+        # Visit siblings in reverse rank-list order on the way down the tree.
+        root = next(rank for rank, parent in parents.items() if parent is None)
+        stack = children[root].copy()
+        broadcast_order = []
+        while stack:
+            rank = stack.pop()
+            broadcast_order.append(rank)
+            stack.extend(children[rank])
+        reduce_positions = {rank: index for index, rank in enumerate(reversed(broadcast_order))}
+        broadcast_positions = {rank: index for index, rank in enumerate(broadcast_order, len(broadcast_order))}
         spans = self._new_anchors(node["id"], ranks, cpu)
         first_internal = {rank: len(self.graphs[rank].tasks) for rank in ranks}
 
@@ -1034,6 +1072,7 @@ class Compiler:
                         0,
                         0,
                         ordering_domain,
+                        comm_position=reduce_positions[rank],
                         tree_role="up",
                         parent=parent,
                         chunk_bytes=chunk_size,
@@ -1056,6 +1095,7 @@ class Compiler:
                         1,
                         0,
                         ordering_domain,
+                        comm_position=broadcast_positions[rank],
                         tree_role="down",
                         parent=parent,
                         chunk_bytes=chunk_size,
